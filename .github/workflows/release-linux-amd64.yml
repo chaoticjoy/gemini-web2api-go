@@ -61,6 +61,7 @@ jobs:
         with:
           tag_name: ${{ env.TAG_NAME }}
           files: dist/*
+          overwrite: true
           generate_release_notes: true
           body: |
             Linux amd64 单二进制，下载直接运行，不需要 Go 也不需要 Docker：
