@@ -170,8 +170,8 @@ func acquireSlot() (Proxy, bool, error) {
 		}
 	}
 
-	if hasProxies {
-		// 代理池存在但都满了 → 不退回直连（因为部署者明确想用代理）
+	if hasProxies || rtCfg().ProxyPoolURL != "" {
+		// 代理池或动态代理配置存在，但未拿到可用代理 → 不退回直连（避免直连 IP 被封）
 		return Proxy{}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 	}
 
