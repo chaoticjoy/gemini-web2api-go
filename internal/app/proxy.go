@@ -81,6 +81,35 @@ func loadProxies() {
 	proxyMu.Unlock()
 }
 
+var (
+	stickyMu       sync.RWMutex
+	lastStickyURL  string
+	lastStickyID   int64
+	lastStickyName string
+)
+
+func getStickyProxy() (string, int64, string) {
+	stickyMu.RLock()
+	defer stickyMu.RUnlock()
+	return lastStickyURL, lastStickyID, lastStickyName
+}
+
+func setStickyProxy(url string, id int64, name string) {
+	stickyMu.Lock()
+	lastStickyURL = url
+	lastStickyID = id
+	lastStickyName = name
+	stickyMu.Unlock()
+}
+
+func clearStickyProxy() {
+	stickyMu.Lock()
+	lastStickyURL = ""
+	lastStickyID = 0
+	lastStickyName = ""
+	stickyMu.Unlock()
+}
+
 // pickProxyWithCapacity 找一个 enabled + fail<5 + 当前限流没满的代理。
 // 返回 (proxy, ok)。所有代理都满时返回 ok=false。
 //
@@ -101,11 +130,30 @@ func pickProxyWithCapacity() (Proxy, bool) {
 	if len(pool) == 0 {
 		return Proxy{}, false
 	}
-	// 从轮询起点开始,找第一个 slot 没满的
+
+	// 粘性模式 (sticky)：优先复用上一次成功的代理
+	if rtCfg().ProxyStrategy == "sticky" {
+		stickyURL, _, _ := getStickyProxy()
+		if stickyURL != "" {
+			for _, p := range pool {
+				if p.URL == stickyURL {
+					if ok, _ := trySlotAcquire(p.ID); ok {
+						return p, true
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// 轮询 (round_robin) 或粘性未命中：从轮询起点开始找第一个 slot 没满的
 	start := atomic.AddUint64(&proxyCursor, 1) - 1
 	for i := 0; i < len(pool); i++ {
 		p := pool[(int(start)+i)%len(pool)]
 		if ok, _ := trySlotAcquire(p.ID); ok {
+			if rtCfg().ProxyStrategy == "sticky" {
+				setStickyProxy(p.URL, p.ID, p.Name)
+			}
 			return p, true
 		}
 	}
@@ -115,6 +163,10 @@ func pickProxyWithCapacity() (Proxy, bool) {
 func recordProxyResult(id int64, success bool, errStr string) {
 	if id == 0 {
 		return
+	}
+	if !success {
+		// 报错时清空粘性代理，强制下一次请求重新挑选/轮询
+		clearStickyProxy()
 	}
 	if pURL, isDyn := isDynamicSlot(id); isDyn {
 		reportRemoteProxyResult(rtCfg().ProxyPoolURL, pURL, success)

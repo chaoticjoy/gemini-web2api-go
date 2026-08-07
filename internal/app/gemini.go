@@ -135,6 +135,39 @@ func (e *RateLimitError) Error() string {
 	return "all proxy slots full: " + e.Reason + " limit reached"
 }
 
+func fetchOrStickyRemoteProxy(poolURL string) (Proxy, bool) {
+	if rtCfg().ProxyStrategy == "sticky" {
+		sURL, sID, sName := getStickyProxy()
+		if _, isDyn := isDynamicSlot(sID); sURL != "" && isDyn {
+			if ok, _ := trySlotAcquire(sID); ok {
+				return Proxy{ID: sID, Name: sName, URL: sURL, Enabled: true}, true
+			}
+		}
+	}
+	pURL, err := fetchRemoteProxy(poolURL)
+	if err != nil {
+		logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
+		return Proxy{}, false
+	}
+	if pURL == "" {
+		return Proxy{}, false
+	}
+	slotID := getDynamicSlotID(pURL)
+	if ok, _ := trySlotAcquire(slotID); ok {
+		pName := "Dynamic (" + pURL + ")"
+		if rtCfg().ProxyStrategy == "sticky" {
+			setStickyProxy(pURL, slotID, pName)
+		}
+		return Proxy{
+			ID:      slotID,
+			Name:    pName,
+			URL:     pURL,
+			Enabled: true,
+		}, true
+	}
+	return Proxy{}, false
+}
+
 // acquireSlot 选一个有容量的 slot 给本次请求用。
 // 优先级：代理池里有容量的代理 → 直连。
 // 全满返回 *RateLimitError。
@@ -170,19 +203,8 @@ func acquireSlot() (Proxy, bool, error) {
 
 	case "dynamic_only":
 		if hasPoolURL {
-			pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL)
-			if err != nil {
-				logf("[proxy-pool] 从动态代理池获取代理失败: %v", err)
-			} else if pURL != "" {
-				slotID := getDynamicSlotID(pURL)
-				if ok, _ := trySlotAcquire(slotID); ok {
-					return Proxy{
-						ID:      slotID,
-						Name:    "Dynamic (" + pURL + ")",
-						URL:     pURL,
-						Enabled: true,
-					}, true, nil
-				}
+			if p, ok := fetchOrStickyRemoteProxy(rtCfg().ProxyPoolURL); ok {
+				return p, true, nil
 			}
 		}
 		return Proxy{ID: -1, Name: "动态代理池(无可用代理)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
@@ -195,19 +217,8 @@ func acquireSlot() (Proxy, bool, error) {
 			}
 		}
 		if hasPoolURL {
-			pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL)
-			if err != nil {
-				logf("[proxy-pool] 从动态代理池获取代理失败: %v", err)
-			} else if pURL != "" {
-				slotID := getDynamicSlotID(pURL)
-				if ok, _ := trySlotAcquire(slotID); ok {
-					return Proxy{
-						ID:      slotID,
-						Name:    "Dynamic (" + pURL + ")",
-						URL:     pURL,
-						Enabled: true,
-					}, true, nil
-				}
+			if p, ok := fetchOrStickyRemoteProxy(rtCfg().ProxyPoolURL); ok {
+				return p, true, nil
 			}
 		}
 		return Proxy{ID: -1, Name: "代理池(全部满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
@@ -219,19 +230,8 @@ func acquireSlot() (Proxy, bool, error) {
 			}
 		}
 		if hasPoolURL {
-			pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL)
-			if err != nil {
-				logf("[proxy-pool] 从动态代理池获取代理失败: %v", err)
-			} else if pURL != "" {
-				slotID := getDynamicSlotID(pURL)
-				if ok, _ := trySlotAcquire(slotID); ok {
-					return Proxy{
-						ID:      slotID,
-						Name:    "Dynamic (" + pURL + ")",
-						URL:     pURL,
-						Enabled: true,
-					}, true, nil
-				}
+			if p, ok := fetchOrStickyRemoteProxy(rtCfg().ProxyPoolURL); ok {
+				return p, true, nil
 			}
 		}
 		if hasProxies || hasPoolURL {
@@ -365,9 +365,21 @@ func streamGenerate(prompt string, mc ModelConfig,
 
 		xsrfToken, xerr := getXSRF(cookieStr, proxyURL)
 		if xerr != nil {
+			lastErr = fmt.Errorf("取 XSRF 凭证失败(%s): %v", picked.Name, xerr)
+			if pickedOK {
+				recordProxyResult(picked.ID, false, xerr.Error())
+			}
 			releaseSlot(picked.ID)
+			if attempt < rtCfg().RetryAttempts-1 {
+				logf("retry %d/%d (代理 %s 获取 XSRF 失败, 切换代理): %v", attempt+1, rtCfg().RetryAttempts, picked.Name, xerr)
+				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				continue
+			}
 			markCookieByStatus(cookieID, 401, xerr.Error())
-			return nil, fmt.Errorf("cookie 无法使用：%w", xerr)
+			return &StreamResult{
+				ProxyID:   picked.ID,
+				ProxyName: picked.Name,
+			}, fmt.Errorf("cookie 无法使用或代理异常：%w", xerr)
 		}
 		body := buildBody(xsrfToken)
 		geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)

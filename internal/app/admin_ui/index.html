@@ -924,6 +924,12 @@ const RT_GROUPS = [
           { v: 'direct_only', l: '仅直连主机 IP' },
         ],
         hint: '明确控制请求如何轮询代理。选择「代理优先模式」可 100% 避免主机直连 IP 被封' },
+      { k: 'proxy_strategy', label: '代理复用策略', type: 'select',
+        options: [
+          { v: 'sticky', l: '粘性复用（优先固定使用好用的 IP，报错/超限时才换 IP）' },
+          { v: 'round_robin', l: '轮询切换（每次请求均匀分散到不同 IP）' },
+        ],
+        hint: '粘性复用可显著提高连接速度与 Cookie 会话稳定性；轮询切换可分散风控风险' },
       { k: 'proxy', label: '静态代理', type: 'text', wide: true,
         hint: '代理池为空时的兜底。一般直接用「代理池」页面配，那里每个代理是独立 slot' },
       { k: 'proxy_pool_url', label: '动态代理池 URL', type: 'text', wide: true,

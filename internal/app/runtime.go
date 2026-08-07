@@ -29,6 +29,7 @@ type RuntimeConfig struct {
 	Proxy           string `json:"proxy"`
 	ProxyPoolURL   string `json:"proxy_pool_url"`
 	ProxyMode      string `json:"proxy_mode"`
+	ProxyStrategy  string `json:"proxy_strategy"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -56,9 +57,13 @@ func initRuntimeConfig() {
 		Proxy:           cfg.Proxy,
 		ProxyPoolURL:   cfg.ProxyPoolURL,
 		ProxyMode:      cfg.ProxyMode,
+		ProxyStrategy:  cfg.ProxyStrategy,
 	}
 	if base.ProxyMode == "" {
 		base.ProxyMode = "auto"
+	}
+	if base.ProxyStrategy == "" {
+		base.ProxyStrategy = "sticky"
 	}
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
@@ -122,6 +127,9 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 	}
 	if c.ProxyMode != "" && c.ProxyMode != "auto" && c.ProxyMode != "pool_only" && c.ProxyMode != "dynamic_only" && c.ProxyMode != "static_only" && c.ProxyMode != "direct_only" {
 		return fmt.Errorf("proxy_mode 无效，支持的值: auto, pool_only, dynamic_only, static_only, direct_only")
+	}
+	if c.ProxyStrategy != "" && c.ProxyStrategy != "sticky" && c.ProxyStrategy != "round_robin" {
+		return fmt.Errorf("proxy_strategy 无效，支持的值: sticky, round_robin")
 	}
 	return nil
 }

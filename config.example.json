@@ -18,5 +18,6 @@
   "proxy": "",
   "proxy_pool_url": "",
   "proxy_mode": "auto",
+  "proxy_strategy": "sticky",
   "log_requests": true
 }

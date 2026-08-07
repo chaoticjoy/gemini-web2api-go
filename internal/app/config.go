@@ -19,6 +19,7 @@ type Config struct {
 	Proxy          string `json:"proxy"`
 	ProxyPoolURL   string `json:"proxy_pool_url"`
 	ProxyMode      string `json:"proxy_mode"`
+	ProxyStrategy  string `json:"proxy_strategy"`
 	Impersonate    string `json:"impersonate"`
 	DBPath         string `json:"db_path"`
 	AdminToken     string `json:"admin_token"`
@@ -51,6 +52,7 @@ func defaultConfig() Config {
 		Proxy:          "",
 		ProxyPoolURL:   "",
 		ProxyMode:      "auto",
+		ProxyStrategy:  "sticky",
 		Impersonate:    "chrome_146",
 		DBPath:         "./data/gemini.db",
 		AdminToken:     "",
