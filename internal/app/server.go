@@ -471,24 +471,68 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Responses API 这条路目前不做真流式，两个回调都传 nil
-	text, toolCalls, res, err := callGemini(prompt, modelCfg, tools, nil, nil)
-	if err != nil {
-		recordRequest("responses", modelName, prompt, "", nil, 502, err.Error(), false)
-		if rle, ok := err.(*RateLimitError); ok {
-			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
-				"message": rle.Error(),
-				"type":    "rate_limit_exceeded",
-				"code":    "ip_slot_full",
-			}})
-			return
+	stream, _ := req["stream"].(bool)
+	rid := "resp_" + randHex(16)
+	mid := "msg_" + randHex(12)
+
+	var onDelta func(string)
+	var flusher http.Flusher
+	var writeEvent func(eventType string, payload interface{})
+
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(200)
+		flusher, _ = w.(http.Flusher)
+		writeEvent = func(eventType string, payload interface{}) {
+			pj, _ := json.Marshal(payload)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, pj)
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
-		writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+
+		writeEvent("response.created", map[string]interface{}{
+			"type": "response.created",
+			"response": map[string]interface{}{
+				"id":     rid,
+				"object": "response",
+				"status": "in_progress",
+				"model":  modelName,
+				"output": []interface{}{},
+			},
+		})
+
+		onDelta = func(delta string) {
+			writeEvent("response.output_text.delta", map[string]interface{}{
+				"type":          "response.output_text.delta",
+				"response_id":    rid,
+				"item_id":        mid,
+				"output_index":   0,
+				"content_index":  0,
+				"delta":         delta,
+			})
+		}
+	}
+
+	text, toolCalls, res, err := callGemini(prompt, modelCfg, tools, onDelta, nil)
+	if err != nil {
+		recordRequest("responses", modelName, prompt, "", nil, 502, err.Error(), stream)
+		if !stream {
+			if rle, ok := err.(*RateLimitError); ok {
+				writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
+					"message": rle.Error(),
+					"type":    "rate_limit_exceeded",
+					"code":    "ip_slot_full",
+				}})
+				return
+			}
+			writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+		}
 		return
 	}
 
-	rid := "resp_" + randHex(16)
-	mid := "msg_" + randHex(12)
 	var output []map[string]interface{}
 	for _, tc := range toolCalls {
 		output = append(output, map[string]interface{}{
@@ -514,31 +558,8 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	stream, _ := req["stream"].(bool)
 	recordRequest("responses", modelName, prompt, text, res, 200, "", stream)
 	if stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(200)
-		flusher, _ := w.(http.Flusher)
-		writeEvent := func(eventType string, payload interface{}) {
-			pj, _ := json.Marshal(payload)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, pj)
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		writeEvent("response.created", map[string]interface{}{
-			"type": "response.created",
-			"response": map[string]interface{}{
-				"id":     rid,
-				"object": "response",
-				"status": "in_progress",
-				"model":  modelName,
-				"output": []interface{}{},
-			},
-		})
 		for _, item := range output {
 			switch item["type"] {
 			case "function_call":
