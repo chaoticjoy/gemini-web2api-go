@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -140,46 +141,107 @@ func (e *RateLimitError) Error() string {
 //
 // 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
 func acquireSlot() (Proxy, bool, error) {
-	// 1. 先试本地代理池（如果配了）
+	mode := rtCfg().ProxyMode
+	if mode == "" {
+		mode = "auto"
+	}
+
 	proxyMu.RLock()
 	hasProxies := len(proxyCache) > 0
 	proxyMu.RUnlock()
 
-	if hasProxies {
-		if p, ok := pickProxyWithCapacity(); ok {
-			return p, true, nil
-		}
-	}
+	hasPoolURL := rtCfg().ProxyPoolURL != ""
 
-	// 2. 如果配置了动态代理池服务 (proxy_pool_url)
-	if poolURL := rtCfg().ProxyPoolURL; poolURL != "" {
-		pURL, err := fetchRemoteProxy(poolURL)
-		if err != nil {
-			logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
-		} else if pURL != "" {
-			slotID := getDynamicSlotID(pURL)
-			if ok, _ := trySlotAcquire(slotID); ok {
-				p := Proxy{
-					ID:      slotID,
-					Name:    "Dynamic (" + pURL + ")",
-					URL:     pURL,
-					Enabled: true,
-				}
+	switch mode {
+	case "direct_only":
+		ok, reason := trySlotAcquire(0)
+		if ok {
+			return Proxy{ID: 0, Name: "直连"}, true, nil
+		}
+		return Proxy{ID: 0, Name: "直连"}, false, &RateLimitError{Reason: reason, ProxyID: 0}
+
+	case "static_only":
+		if hasProxies {
+			if p, ok := pickProxyWithCapacity(); ok {
 				return p, true, nil
 			}
 		}
-	}
+		return Proxy{ID: -1, Name: "静态代理池(满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 
-	if hasProxies || rtCfg().ProxyPoolURL != "" {
-		// 代理池或动态代理配置存在，但未拿到可用代理 → 不退回直连（避免直连 IP 被封）
-		return Proxy{ID: -1, Name: "代理池(满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
-	}
+	case "dynamic_only":
+		if hasPoolURL {
+			pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL)
+			if err != nil {
+				logf("[proxy-pool] 从动态代理池获取代理失败: %v", err)
+			} else if pURL != "" {
+				slotID := getDynamicSlotID(pURL)
+				if ok, _ := trySlotAcquire(slotID); ok {
+					return Proxy{
+						ID:      slotID,
+						Name:    "Dynamic (" + pURL + ")",
+						URL:     pURL,
+						Enabled: true,
+					}, true, nil
+				}
+			}
+		}
+		return Proxy{ID: -1, Name: "动态代理池(无可用代理)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 
-	// 3. 没配代理池 → 用直连 slot（id=0）
-	if ok, reason := trySlotAcquire(0); ok {
-		return Proxy{}, true, nil // ProxyID=0 表示直连
-	} else {
-		return Proxy{}, false, &RateLimitError{Reason: reason, ProxyID: 0}
+	case "pool_only":
+		// 代理优先模式：先试静态，再试动态，绝不直连
+		if hasProxies {
+			if p, ok := pickProxyWithCapacity(); ok {
+				return p, true, nil
+			}
+		}
+		if hasPoolURL {
+			pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL)
+			if err != nil {
+				logf("[proxy-pool] 从动态代理池获取代理失败: %v", err)
+			} else if pURL != "" {
+				slotID := getDynamicSlotID(pURL)
+				if ok, _ := trySlotAcquire(slotID); ok {
+					return Proxy{
+						ID:      slotID,
+						Name:    "Dynamic (" + pURL + ")",
+						URL:     pURL,
+						Enabled: true,
+					}, true, nil
+				}
+			}
+		}
+		return Proxy{ID: -1, Name: "代理池(全部满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+
+	default: // "auto" 自动混合模式
+		if hasProxies {
+			if p, ok := pickProxyWithCapacity(); ok {
+				return p, true, nil
+			}
+		}
+		if hasPoolURL {
+			pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL)
+			if err != nil {
+				logf("[proxy-pool] 从动态代理池获取代理失败: %v", err)
+			} else if pURL != "" {
+				slotID := getDynamicSlotID(pURL)
+				if ok, _ := trySlotAcquire(slotID); ok {
+					return Proxy{
+						ID:      slotID,
+						Name:    "Dynamic (" + pURL + ")",
+						URL:     pURL,
+						Enabled: true,
+					}, true, nil
+				}
+			}
+		}
+		if hasProxies || hasPoolURL {
+			return Proxy{ID: -1, Name: "代理池(满/不可用)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+		}
+		ok, reason := trySlotAcquire(0)
+		if ok {
+			return Proxy{ID: 0, Name: "直连"}, true, nil
+		}
+		return Proxy{ID: 0, Name: "直连"}, false, &RateLimitError{Reason: reason, ProxyID: 0}
 	}
 }
 
@@ -189,11 +251,6 @@ func releaseSlot(proxyID int64) {
 }
 
 // deltaTracker 把上游的累积帧转成增量。
-//
-// 上游每帧带的是**到目前为止的全文**，不是新增部分，所以要跟已发出的做前缀
-// 比对。帧之间偶尔不满足前缀关系（模型改写、或 clean 掉的 artifact 落在边界
-// 上），这时宁可跳过也不能发——发了就等于把重复内容推给客户端，而已发出的
-// 内容收不回来。漏掉的部分由调用方在结束时用 remainingText 补齐。
 type deltaTracker struct{ emitted string }
 
 // Push 吃进一帧的累积全文，返回相对上一次的增量；没有新增或无法安全 diff 时返回 ""。
@@ -209,10 +266,6 @@ func (d *deltaTracker) Push(fullText string) string {
 
 // streamGenerate POSTs to Gemini's StreamGenerate endpoint and returns raw body
 // plus proxy/timing telemetry for the metrics layer.
-// The 80-slot inner array is verbatim from the Python reference.
-// onDelta 非 nil 时开启真流式：上游每写一帧就解析一次，跟已发出的内容做前缀
-// diff，把新增部分立刻回调出去。上游每帧带的是累积全文而不是增量，diff 必须
-// 自己做。一旦已经吐过内容就不再重试——重试会让客户端收到重复文本。
 func streamGenerate(prompt string, mc ModelConfig,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
 	inner := make([]interface{}, 80)
@@ -223,7 +276,6 @@ func streamGenerate(prompt string, mc ModelConfig,
 	inner[7] = 1
 	inner[10] = 1
 	inner[11] = 0
-	// 会话内轮次索引；我们每次都是新会话，恒为 0。
 	inner[17] = []interface{}{[]interface{}{0}}
 	inner[18] = 0
 	inner[27] = 1
@@ -253,8 +305,6 @@ func streamGenerate(prompt string, mc ModelConfig,
 
 	cookieStr, sapisid, cookieID := loadCookie()
 
-	// 带 cookie 时必须多发一个表单字段 at（XSRF token），否则上游直接 400。
-	// 匿名请求不需要，getXSRF 对空 cookie 返回空串。见 xsrf.go。
 	buildBody := func(at string) string {
 		form := url.Values{}
 		form.Set("f.req", string(outerJSON))
@@ -264,36 +314,10 @@ func streamGenerate(prompt string, mc ModelConfig,
 		return form.Encode()
 	}
 
-	// 通过限流器拿一个 slot（代理或直连）。所有 slot 满 → 直接 429。
-	picked, slotOK, slotErr := acquireSlot()
-	if !slotOK {
-		return &StreamResult{
-			ProxyID:   picked.ID,
-			ProxyName: picked.Name,
-		}, slotErr
-	}
-	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
-
-	proxyURL := picked.URL
-	if proxyURL == "" {
-		proxyURL = rtCfg().Proxy // fallback 静态 proxy（一般用不到）
-	}
-	pickedOK := picked.ID != 0 // 是否真用了代理池里的代理（包含动态代理 ID<0 和本地代理 ID>0）
-
-	// 取 XSRF token 要走跟正式请求同一个出口，否则 token 和请求来自两个 IP。
-	xsrfToken, xerr := getXSRF(cookieStr, proxyURL)
-	if xerr != nil {
-		markCookieByStatus(cookieID, 401, xerr.Error())
-		return nil, fmt.Errorf("cookie 无法使用：%w", xerr)
-	}
-	body := buildBody(xsrfToken)
-
-	geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 	var lastErr error
-	// 最后一次拿到的 HTTP 状态码，0 表示网络层就失败了没拿到响应。
-	// cookie 健康度只认 401/403，别的状态不算 cookie 的错，见 markCookieByStatus。
-	lastStatus := 0
-	xsrfRetried := false // XSRF 自愈只做一次，避免死循环
+	var lastStatus int
+	var lastPicked Proxy
+	xsrfRetried := false
 	t0 := time.Now()
 
 	tracker := &deltaTracker{}
@@ -301,7 +325,6 @@ func streamGenerate(prompt string, mc ModelConfig,
 	var lineCB func(string)
 	if onDelta != nil || onReasoning != nil {
 		lineCB = func(line string) {
-			// 思考链先推完才轮到正文，所以先处理它，客户端拿到的顺序才对。
 			if onReasoning != nil {
 				if r := reasoningInLine(line); r != "" {
 					if d := rtracker.Push(r); d != "" {
@@ -321,31 +344,58 @@ func streamGenerate(prompt string, mc ModelConfig,
 	}
 
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+		// 每次重试都重新获取一个 slot (切换不同代理)
+		picked, slotOK, slotErr := acquireSlot()
+		if !slotOK {
+			if lastErr != nil {
+				break
+			}
+			return &StreamResult{
+				ProxyID:   picked.ID,
+				ProxyName: picked.Name,
+			}, slotErr
+		}
+		lastPicked = picked
+
+		proxyURL := picked.URL
+		if proxyURL == "" {
+			proxyURL = rtCfg().Proxy
+		}
+		pickedOK := picked.ID != 0
+
+		xsrfToken, xerr := getXSRF(cookieStr, proxyURL)
+		if xerr != nil {
+			releaseSlot(picked.ID)
+			markCookieByStatus(cookieID, 401, xerr.Error())
+			return nil, fmt.Errorf("cookie 无法使用：%w", xerr)
+		}
+		body := buildBody(xsrfToken)
+		geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+
 		statusCode, raw, ttfb, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
 		if err != nil {
 			lastErr = err
 			if pickedOK {
 				recordProxyResult(picked.ID, false, err.Error())
 			}
-			// 已经往客户端吐过内容就不能重试，否则会重复（思考链也算吐过）。
+			releaseSlot(picked.ID)
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
+				logf("retry %d/%d (切换代理): %v", attempt+1, rtCfg().RetryAttempts, err)
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
 		}
 		if statusCode != 200 {
-			// token 过期时上游回 400 + xsrf。作废缓存重取一次再打，
-			// 这种自愈不算进重试预算，否则一次过期就吃掉全部重试。
 			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
 				invalidateXSRF(cookieStr)
 				if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+					releaseSlot(picked.ID)
 					attempt--
 					continue
 				}
@@ -355,10 +405,12 @@ func streamGenerate(prompt string, mc ModelConfig,
 			if pickedOK {
 				recordProxyResult(picked.ID, false, lastErr.Error())
 			}
+			releaseSlot(picked.ID)
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
+				logf("retry %d/%d (HTTP %d, 切换代理): %v", attempt+1, rtCfg().RetryAttempts, statusCode, lastErr)
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
@@ -366,6 +418,7 @@ func streamGenerate(prompt string, mc ModelConfig,
 		if pickedOK {
 			recordProxyResult(picked.ID, true, "")
 		}
+		releaseSlot(picked.ID)
 		markCookieByStatus(cookieID, 200, "")
 		return &StreamResult{
 			Emitted:          tracker.emitted,
@@ -379,10 +432,18 @@ func streamGenerate(prompt string, mc ModelConfig,
 			TotalMs:          time.Since(t0).Milliseconds(),
 		}, nil
 	}
+
 	if lastErr != nil {
 		markCookieByStatus(cookieID, lastStatus, lastErr.Error())
+		return &StreamResult{
+			ProxyID:   lastPicked.ID,
+			ProxyName: lastPicked.Name,
+		}, lastErr
 	}
-	return nil, lastErr
+	return &StreamResult{
+		ProxyID:   lastPicked.ID,
+		ProxyName: lastPicked.Name,
+	}, errors.New("request failed")
 }
 
 // upstreamModelRe 匹配响应帧里服务端自报的模型显示名（帧的 [42] 位）。

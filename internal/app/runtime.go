@@ -28,6 +28,7 @@ type RuntimeConfig struct {
 	GeminiBL        string `json:"gemini_bl"`
 	Proxy           string `json:"proxy"`
 	ProxyPoolURL   string `json:"proxy_pool_url"`
+	ProxyMode      string `json:"proxy_mode"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -54,6 +55,10 @@ func initRuntimeConfig() {
 		GeminiBL:        cfg.GeminiBL,
 		Proxy:           cfg.Proxy,
 		ProxyPoolURL:   cfg.ProxyPoolURL,
+		ProxyMode:      cfg.ProxyMode,
+	}
+	if base.ProxyMode == "" {
+		base.ProxyMode = "auto"
 	}
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
@@ -114,6 +119,9 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		if !strings.HasPrefix(c.ProxyPoolURL, "http://") && !strings.HasPrefix(c.ProxyPoolURL, "https://") {
 			return fmt.Errorf("proxy_pool_url 必须以 http:// 或 https:// 开头")
 		}
+	}
+	if c.ProxyMode != "" && c.ProxyMode != "auto" && c.ProxyMode != "pool_only" && c.ProxyMode != "dynamic_only" && c.ProxyMode != "static_only" && c.ProxyMode != "direct_only" {
+		return fmt.Errorf("proxy_mode 无效，支持的值: auto, pool_only, dynamic_only, static_only, direct_only")
 	}
 	return nil
 }

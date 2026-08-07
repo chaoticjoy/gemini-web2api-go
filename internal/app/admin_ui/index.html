@@ -915,6 +915,15 @@ const RT_GROUPS = [
         hint: 'chrome_146 / chrome_144 / firefox_147 / safari_16_0 …' },
       { k: 'gemini_bl', label: 'Gemini bl 版本', type: 'text',
         hint: '上游前端版本号。请求大面积失败时先看这里是不是过期了' },
+      { k: 'proxy_mode', label: '代理调度模式', type: 'select',
+        options: [
+          { v: 'auto', l: '自动混合模式（静态代理 → 动态代理 → 无配置退回直连）' },
+          { v: 'pool_only', l: '代理优先模式（静态代理 → 动态代理，禁止退回直连）' },
+          { v: 'dynamic_only', l: '仅动态代理池（每次实时 GET /api/proxy，禁止直连）' },
+          { v: 'static_only', l: '仅面板静态代理列表（禁止退回直连）' },
+          { v: 'direct_only', l: '仅直连主机 IP' },
+        ],
+        hint: '明确控制请求如何轮询代理。选择「代理优先模式」可 100% 避免主机直连 IP 被封' },
       { k: 'proxy', label: '静态代理', type: 'text', wide: true,
         hint: '代理池为空时的兜底。一般直接用「代理池」页面配，那里每个代理是独立 slot' },
       { k: 'proxy_pool_url', label: '动态代理池 URL', type: 'text', wide: true,
@@ -947,8 +956,9 @@ async function loadRtCfg() {
           if (f.type === 'bool') {
             input = `<input type="checkbox" id="rt_${f.k}" ${v ? 'checked' : ''}>`;
           } else if (f.type === 'select') {
-            input = `<select id="rt_${f.k}">` + rtModels.map(m =>
-              `<option value="${escapeHtml(m)}" ${m === v ? 'selected' : ''}>${escapeHtml(m)}</option>`
+            const opts = f.options || rtModels.map(m => ({ v: m, l: m }));
+            input = `<select id="rt_${f.k}">` + opts.map(o =>
+              `<option value="${escapeHtml(o.v)}" ${o.v === v ? 'selected' : ''}>${escapeHtml(o.l)}</option>`
             ).join('') + '</select>';
           } else if (f.type === 'int') {
             input = `<input type="number" id="rt_${f.k}" value="${v}" min="${f.min}" max="${f.max}">`;

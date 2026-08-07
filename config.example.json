@@ -17,5 +17,6 @@
   "cookie_file": "",
   "proxy": "",
   "proxy_pool_url": "",
+  "proxy_mode": "auto",
   "log_requests": true
 }
