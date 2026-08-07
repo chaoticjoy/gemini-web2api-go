@@ -208,19 +208,36 @@ func parseRemoteProxyItems(bodyBytes []byte) ([]RemoteProxyItem, error) {
 		return nil, errors.New("empty response body")
 	}
 
-	var items []RemoteProxyItem
-	if err := json.Unmarshal(bodyBytes, &items); err == nil && len(items) > 0 {
-		return items, nil
+	// 1. 尝试 []RemoteProxyItem (JSON 对象数组)
+	var rawItems []RemoteProxyItem
+	if err := json.Unmarshal(bodyBytes, &rawItems); err == nil {
+		var valid []RemoteProxyItem
+		for _, item := range rawItems {
+			if strings.TrimSpace(item.URL) != "" {
+				valid = append(valid, item)
+			}
+		}
+		if len(valid) > 0 {
+			return valid, nil
+		}
 	}
 
+	// 2. 尝试 []string (字符串数组)
 	var strList []string
 	if err := json.Unmarshal(bodyBytes, &strList); err == nil && len(strList) > 0 {
+		var items []RemoteProxyItem
 		for _, s := range strList {
-			items = append(items, RemoteProxyItem{URL: s})
+			s = strings.TrimSpace(s)
+			if s != "" {
+				items = append(items, RemoteProxyItem{URL: s})
+			}
 		}
-		return items, nil
+		if len(items) > 0 {
+			return items, nil
+		}
 	}
 
+	// 3. 尝试包裹对象 {"proxies": [...], ...}
 	var rawMap map[string]json.RawMessage
 	if err := json.Unmarshal(bodyBytes, &rawMap); err == nil {
 		for _, k := range []string{"proxies", "items", "data", "list", "proxies_list"} {
@@ -232,7 +249,9 @@ func parseRemoteProxyItems(bodyBytes []byte) ([]RemoteProxyItem, error) {
 		}
 	}
 
+	// 4. 尝试按行分隔的文本
 	lines := strings.Split(string(bodyBytes), "\n")
+	var items []RemoteProxyItem
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line != "" && validateProxyURL(line) == nil {
