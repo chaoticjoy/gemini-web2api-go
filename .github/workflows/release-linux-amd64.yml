@@ -19,14 +19,29 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # tag 和代码里的 Version 常量对不上就直接失败。
+      - name: Determine release version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag_name="${GITHUB_REF_NAME}"
+            ver="${GITHUB_REF_NAME}"
+          else
+            code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/app/server.go)
+            [ -z "$code" ] && code="4.0.0"
+            tag_name="v${code}"
+            ver="v${code}"
+          fi
+          echo "TAG_NAME=${tag_name}" >> $GITHUB_ENV
+          echo "VER=${ver}" >> $GITHUB_ENV
+          echo "Determined version: ${ver}, release tag: ${tag_name}"
+
+      # 如果是推 Tag 触发，校验 tag 与代码 Version 是否匹配
       - name: Check tag matches Version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' server.go)
+          code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/app/server.go)
           echo "tag=$tag  server.go=$code"
-          [ "$tag" = "$code" ] || { echo "::error::tag $tag 与 server.go 里的 $code 不一致"; exit 1; }
+          [ "$tag" = "$code" ] || { echo "::error::tag $tag 与 internal/app/server.go 里的 $code 不一致"; exit 1; }
 
       - run: go test ./...
 
@@ -36,15 +51,15 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          ver="${GITHUB_REF_NAME}"
-          out="dist/gemini-web2api-go_${ver}_linux_amd64"
+          out="dist/gemini-web2api-go_${VER}_linux_amd64"
           echo "building $out"
           GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$out" .
           cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create or update Release
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG_NAME }}
           files: dist/*
           generate_release_notes: true
           body: |
