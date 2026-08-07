@@ -140,7 +140,7 @@ func (e *RateLimitError) Error() string {
 //
 // 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
 func acquireSlot() (Proxy, bool, error) {
-	// 1. 先试代理池（如果配了）
+	// 1. 先试本地代理池（如果配了）
 	proxyMu.RLock()
 	hasProxies := len(proxyCache) > 0
 	proxyMu.RUnlock()
@@ -149,11 +149,30 @@ func acquireSlot() (Proxy, bool, error) {
 		if p, ok := pickProxyWithCapacity(); ok {
 			return p, true, nil
 		}
+	}
+
+	// 2. 如果配置了动态代理池服务 (proxy_pool_url)
+	if poolURL := rtCfg().ProxyPoolURL; poolURL != "" {
+		if pURL, err := fetchRemoteProxy(poolURL); err == nil && pURL != "" {
+			slotID := getDynamicSlotID(pURL)
+			if ok, _ := trySlotAcquire(slotID); ok {
+				p := Proxy{
+					ID:      slotID,
+					Name:    "Dynamic ProxyPool",
+					URL:     pURL,
+					Enabled: true,
+				}
+				return p, true, nil
+			}
+		}
+	}
+
+	if hasProxies {
 		// 代理池存在但都满了 → 不退回直连（因为部署者明确想用代理）
 		return Proxy{}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 	}
 
-	// 2. 没配代理池 → 用直连 slot（id=0）
+	// 3. 没配代理池 → 用直连 slot（id=0）
 	if ok, reason := trySlotAcquire(0); ok {
 		return Proxy{}, true, nil // ProxyID=0 表示直连
 	} else {

@@ -130,6 +130,8 @@ func Run() {
 		mux.HandleFunc("/admin/api/timeseries", requireAuth(handleAdminTimeseries))
 		mux.HandleFunc("/admin/api/requests", requireAuth(handleAdminRequests))
 		mux.HandleFunc("/admin/api/proxies", requireAuth(handleAdminProxies))
+		mux.HandleFunc("/admin/api/proxies/sync", requireAuth(handleAdminProxySync))
+		mux.HandleFunc("/admin/api/proxies/test-pool", requireAuth(handleAdminProxyTestPool))
 		mux.HandleFunc("/admin/api/proxies/", requireAuth(handleAdminProxyItem))
 		mux.HandleFunc("/admin/api/apikey", requireAuth(handleAdminAPIKey))
 		mux.HandleFunc("/admin/api/usage", requireAuth(handleAdminUsage))

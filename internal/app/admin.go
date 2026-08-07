@@ -457,6 +457,52 @@ func handleAdminProxyItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func handleAdminProxySync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	poolURL := rtCfg().ProxyPoolURL
+	if poolURL == "" {
+		writeJSON(w, 400, map[string]string{"error": "未配置动态代理池地址 (proxy_pool_url)"})
+		return
+	}
+	imported, err := syncRemoteProxies(poolURL)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"imported": imported, "ok": true})
+}
+
+func handleAdminProxyTestPool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req struct {
+		URL string `json:"url"`
+	}
+	if r.Body != nil {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &req)
+	}
+	poolURL := req.URL
+	if poolURL == "" {
+		poolURL = rtCfg().ProxyPoolURL
+	}
+	if poolURL == "" {
+		writeJSON(w, 400, map[string]string{"error": "代理池地址为空"})
+		return
+	}
+	stats, err := testRemoteProxyPool(poolURL)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"ok": true, "stats": stats})
+}
+
 // /admin/api/usage — 返回每个 IP slot 的当前限流用量。
 func handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 	usage := allSlotUsage()

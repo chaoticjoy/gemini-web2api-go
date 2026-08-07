@@ -1,7 +1,11 @@
 package app
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +28,32 @@ var (
 	proxyMu     sync.RWMutex
 	proxyCache  []Proxy
 	proxyCursor uint64
+
+	dynamicSlotsMu   sync.RWMutex
+	dynamicProxyMap  = map[string]int64{}
+	dynamicProxyURLs = map[int64]string{}
+	nextDynamicID    int64 = -1000
 )
+
+func getDynamicSlotID(proxyURL string) int64 {
+	dynamicSlotsMu.Lock()
+	defer dynamicSlotsMu.Unlock()
+	if id, ok := dynamicProxyMap[proxyURL]; ok {
+		return id
+	}
+	id := nextDynamicID
+	nextDynamicID--
+	dynamicProxyMap[proxyURL] = id
+	dynamicProxyURLs[id] = proxyURL
+	return id
+}
+
+func isDynamicSlot(id int64) (string, bool) {
+	dynamicSlotsMu.RLock()
+	defer dynamicSlotsMu.RUnlock()
+	url, ok := dynamicProxyURLs[id]
+	return url, ok
+}
 
 // loadProxies refreshes the in-memory proxy list from DB.
 func loadProxies() {
@@ -86,6 +115,10 @@ func recordProxyResult(id int64, success bool, errStr string) {
 	if id == 0 {
 		return
 	}
+	if pURL, isDyn := isDynamicSlot(id); isDyn {
+		reportRemoteProxyResult(rtCfg().ProxyPoolURL, pURL, success)
+		return
+	}
 	now := time.Now().Unix()
 	if success {
 		_, _ = getDB().Exec(`UPDATE proxies SET fail_count=0, last_used=?, last_error='' WHERE id=?`, now, id)
@@ -94,6 +127,138 @@ func recordProxyResult(id int64, success bool, errStr string) {
 			now, errStr, id)
 	}
 	loadProxies()
+}
+
+// Dynamic Proxy Pool Client Functions ────────────────────────────────────────
+
+type RemoteProxyItem struct {
+	URL          string `json:"url"`
+	Type         string `json:"type"`
+	IP           string `json:"ip"`
+	Port         string `json:"port"`
+	SuccessCount int    `json:"success_count"`
+	FailCount    int    `json:"fail_count"`
+}
+
+type RemoteProxyReportReq struct {
+	URL     string `json:"url"`
+	Success bool   `json:"success"`
+}
+
+func fetchRemoteProxy(poolURL string) (string, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy"
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("remote pool HTTP %d", resp.StatusCode)
+	}
+	var item RemoteProxyItem
+	if err := json.NewDecoder(resp.Body).Decode(&item); err != nil {
+		return "", err
+	}
+	if item.URL == "" {
+		return "", errors.New("empty proxy url from remote pool")
+	}
+	return item.URL, nil
+}
+
+func reportRemoteProxyResult(poolURL, proxyURL string, success bool) {
+	if poolURL == "" || proxyURL == "" {
+		return
+	}
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy/report"
+		payload := RemoteProxyReportReq{URL: proxyURL, Success: success}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		resp, err := client.Post(reqURL, "application/json", bytes.NewReader(b))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+}
+
+func syncRemoteProxies(poolURL string) (int, error) {
+	if poolURL == "" {
+		return 0, errors.New("remote pool url is empty")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy/all"
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch proxies: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("remote pool HTTP %d", resp.StatusCode)
+	}
+	var items []RemoteProxyItem
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return 0, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	imported := 0
+	for _, item := range items {
+		pURL := strings.TrimSpace(item.URL)
+		if pURL == "" {
+			continue
+		}
+		if err := validateProxyURL(pURL); err != nil {
+			continue
+		}
+		var count int
+		err := getDB().QueryRow(`SELECT COUNT(1) FROM proxies WHERE url=?`, pURL).Scan(&count)
+		if err != nil || count > 0 {
+			continue
+		}
+		name := item.IP
+		if item.Port != "" {
+			name += ":" + item.Port
+		}
+		if name == "" {
+			name = pURL
+		}
+		_, err = getDB().Exec(`INSERT INTO proxies(name, url, enabled, weight, created_at) VALUES (?,?,1,1,?)`,
+			name, pURL, time.Now().Unix())
+		if err == nil {
+			imported++
+		}
+	}
+	if imported > 0 {
+		loadProxies()
+	}
+	return imported, nil
+}
+
+func testRemoteProxyPool(poolURL string) (map[string]interface{}, error) {
+	if poolURL == "" {
+		return nil, errors.New("remote pool url is empty")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy/stats"
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		reqURL = strings.TrimRight(poolURL, "/") + "/health"
+		resp2, err2 := client.Get(reqURL)
+		if err2 != nil {
+			return nil, fmt.Errorf("failed to connect to pool: %w", err)
+		}
+		defer resp2.Body.Close()
+		return map[string]interface{}{"status": "ok", "message": "connected via /health"}, nil
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return map[string]interface{}{"status": "ok", "message": "connected"}, nil
+	}
+	return result, nil
 }
 
 // CRUD ───────────────────────────────────────────────────────────────────────

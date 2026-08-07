@@ -26,6 +26,7 @@ type RuntimeConfig struct {
 	Impersonate     string `json:"impersonate"`
 	GeminiBL        string `json:"gemini_bl"`
 	Proxy           string `json:"proxy"`
+	ProxyPoolURL   string `json:"proxy_pool_url"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -51,6 +52,7 @@ func initRuntimeConfig() {
 		Impersonate:     cfg.Impersonate,
 		GeminiBL:        cfg.GeminiBL,
 		Proxy:           cfg.Proxy,
+		ProxyPoolURL:   cfg.ProxyPoolURL,
 	}
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
@@ -106,6 +108,11 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 	}
 	if c.GeminiBL == "" {
 		return fmt.Errorf("gemini_bl 不能为空")
+	}
+	if c.ProxyPoolURL != "" {
+		if !strings.HasPrefix(c.ProxyPoolURL, "http://") && !strings.HasPrefix(c.ProxyPoolURL, "https://") {
+			return fmt.Errorf("proxy_pool_url 必须以 http:// 或 https:// 开头")
+		}
 	}
 	return nil
 }

@@ -16,5 +16,6 @@
   "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
   "cookie_file": "",
   "proxy": "",
+  "proxy_pool_url": "",
   "log_requests": true
 }

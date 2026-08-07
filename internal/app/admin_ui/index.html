@@ -554,16 +554,18 @@ const pages = {
     return `
       <div class="panel page-fill">
         <h2>代理池
-          <span class="controls"><button class="btn" onclick="addProxy()">+ 添加代理</button></span>
+          <span class="controls">
+            <button class="btn muted" onclick="syncProxyPool()">🔄 从动态代理池同步</button>
+            <button class="btn muted" onclick="testProxyPool()">⚡ 测试动态代理池</button>
+            <button class="btn" onclick="addProxy()">+ 添加代理</button>
+          </span>
         </h2>
         <details class="note">
-          <summary>每个代理是一个独立 IP slot</summary>
+          <summary>每个代理是一个独立 IP slot（支持本地静态代理 & 动态代理池服务）</summary>
           <div class="body">
             每个代理享有独立的并发 / RPM / RPH 配额，<b>配越多代理，总容量线性放大</b>。
-            请求会自动找有空位的代理，都满则返回 HTTP 429。失败 5 次自动熔断，
-            「重置」可手动恢复。<br><br>
-            注意：配了至少一个代理后<b>不会再退回直连</b>，避免代理满了把主机 IP 也打爆。
-            实测单个出口约 85 次请求就会被 Google 拦，所以扩容只能靠加出口。
+            若在系统设置中配置了 <b>动态代理池 URL</b> (如 http://127.0.0.1:8888)，请求时会自动向动态代理池申请可用代理，并在完成后自动上报成功/失败状态。<br><br>
+            您也可以点击上方「从动态代理池同步」将代理池服务中的代理一键导入到本地列表。
           </div>
         </details>
         <div class="table-scroll">
@@ -914,6 +916,8 @@ const RT_GROUPS = [
         hint: '上游前端版本号。请求大面积失败时先看这里是不是过期了' },
       { k: 'proxy', label: '静态代理', type: 'text', wide: true,
         hint: '代理池为空时的兜底。一般直接用「代理池」页面配，那里每个代理是独立 slot' },
+      { k: 'proxy_pool_url', label: '动态代理池 URL', type: 'text', wide: true,
+        hint: '自建动态代理池 REST API 服务地址，如 http://127.0.0.1:8888 (格式参考 proxy.md)' },
     ],
   },
   {
@@ -1135,6 +1139,23 @@ async function resetProxy(id) {
   await api('/admin/api/proxies/' + id + '/reset', { method: 'POST' });
   flash('已重置失败计数');
   await refreshPage();
+}
+async function syncProxyPool() {
+  const r = await api('/admin/api/proxies/sync', { method: 'POST' });
+  if (r && r.ok) {
+    flash(`成功从动态代理池导入 ${r.imported} 个新代理`);
+    await refreshPage();
+  } else if (r && r.error) {
+    flash('同步失败：' + r.error);
+  }
+}
+async function testProxyPool() {
+  const r = await api('/admin/api/proxies/test-pool', { method: 'POST' });
+  if (r && r.ok) {
+    flash('动态代理池连接成功！');
+  } else if (r && r.error) {
+    flash('连接失败：' + r.error);
+  }
 }
 // Cookie 池 ────────────────────────────────────────────────────────────────
 
