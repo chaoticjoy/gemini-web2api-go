@@ -514,9 +514,11 @@ func handleAdminUsage(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]interface{}, 0, len(usage))
 	for _, u := range usage {
 		name := "直连"
-		if u.ProxyID > 0 {
+		if u.ProxyID != 0 {
 			if n, ok := proxyNames[u.ProxyID]; ok {
 				name = n
+			} else if dynURL, isDyn := isDynamicSlot(u.ProxyID); isDyn {
+				name = "Dynamic (" + dynURL + ")"
 			} else {
 				name = "(已删除)"
 			}

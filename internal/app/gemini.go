@@ -275,7 +275,7 @@ func streamGenerate(prompt string, mc ModelConfig,
 	if proxyURL == "" {
 		proxyURL = rtCfg().Proxy // fallback 静态 proxy（一般用不到）
 	}
-	pickedOK := picked.ID > 0 // 是否真用了代理池里的代理
+	pickedOK := picked.ID != 0 // 是否真用了代理池里的代理（包含动态代理 ID<0 和本地代理 ID>0）
 
 	// 取 XSRF token 要走跟正式请求同一个出口，否则 token 和请求来自两个 IP。
 	xsrfToken, xerr := getXSRF(cookieStr, proxyURL)
