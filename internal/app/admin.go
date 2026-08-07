@@ -605,8 +605,11 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	var proxyID int64
 	useDirect := false
 	if proxyIDStr == "" || proxyIDStr == "dynamic" {
-		// 1. 先试本地代理池
-		if proxyIDStr == "" {
+		mode := rtCfg().ProxyMode
+		if mode == "" {
+			mode = "auto"
+		}
+		if mode != "dynamic_only" && mode != "direct_only" {
 			for _, p := range listProxies() {
 				if p.Enabled && p.FailCount < 5 {
 					proxyURL = p.URL
@@ -616,21 +619,22 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		// 2. 如果没有本地代理或显式指定 dynamic，尝试从动态代理池获取
-		if proxyURL == "" && rtCfg().ProxyPoolURL != "" {
+		// 2. 尝试从动态代理池获取
+		if proxyURL == "" && rtCfg().ProxyPoolURL != "" && mode != "static_only" && mode != "direct_only" {
 			if pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL); err == nil && pURL != "" {
 				proxyURL = pURL
 				proxyName = "Dynamic (" + pURL + ")"
 				proxyID = getDynamicSlotID(pURL)
 			}
 		}
-		// 3. 直连
-		if proxyURL == "" && proxyIDStr != "dynamic" {
+		// 3. 直连或报错
+		if proxyURL == "" {
+			if mode == "pool_only" || mode == "dynamic_only" || mode == "static_only" || proxyIDStr == "dynamic" {
+				writeJSON(w, 400, map[string]string{"error": "当前代理模式禁用直连，且未能获取到可用代理"})
+				return
+			}
 			useDirect = true
 			proxyName = "直连"
-		} else if proxyURL == "" && proxyIDStr == "dynamic" {
-			writeJSON(w, 400, map[string]string{"error": "无法从动态代理池获取可用代理或未配置 proxy_pool_url"})
-			return
 		}
 	} else {
 		var err error

@@ -163,6 +163,27 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 		}
 		r.ProxyName = res.ProxyName
 	}
+	if r.ProxyName == "" {
+		mode := rtCfg().ProxyMode
+		switch mode {
+		case "dynamic_only":
+			r.ProxyName = "动态代理池"
+		case "pool_only":
+			r.ProxyName = "代理池"
+		case "static_only":
+			r.ProxyName = "静态代理池"
+		case "direct_only":
+			r.ProxyName = "直连"
+		default:
+			if rtCfg().ProxyPoolURL != "" {
+				r.ProxyName = "动态代理池"
+			} else if len(proxyCache) > 0 {
+				r.ProxyName = "静态代理池"
+			} else {
+				r.ProxyName = "直连"
+			}
+		}
+	}
 	go insertRequest(r)
 }
 
