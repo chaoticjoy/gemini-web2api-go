@@ -153,12 +153,15 @@ func acquireSlot() (Proxy, bool, error) {
 
 	// 2. 如果配置了动态代理池服务 (proxy_pool_url)
 	if poolURL := rtCfg().ProxyPoolURL; poolURL != "" {
-		if pURL, err := fetchRemoteProxy(poolURL); err == nil && pURL != "" {
+		pURL, err := fetchRemoteProxy(poolURL)
+		if err != nil {
+			logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
+		} else if pURL != "" {
 			slotID := getDynamicSlotID(pURL)
 			if ok, _ := trySlotAcquire(slotID); ok {
 				p := Proxy{
 					ID:      slotID,
-					Name:    "Dynamic ProxyPool",
+					Name:    "Dynamic (" + pURL + ")",
 					URL:     pURL,
 					Enabled: true,
 				}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -145,9 +146,24 @@ type RemoteProxyReportReq struct {
 	Success bool   `json:"success"`
 }
 
+func normalizePoolURL(poolURL string) string {
+	u := strings.TrimSpace(poolURL)
+	if u == "" {
+		return ""
+	}
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		u = "http://" + u
+	}
+	return strings.TrimRight(u, "/")
+}
+
 func fetchRemoteProxy(poolURL string) (string, error) {
+	poolURL = normalizePoolURL(poolURL)
+	if poolURL == "" {
+		return "", errors.New("empty pool url")
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
-	reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy"
+	reqURL := poolURL + "/api/proxy"
 	resp, err := client.Get(reqURL)
 	if err != nil {
 		return "", err
@@ -167,6 +183,7 @@ func fetchRemoteProxy(poolURL string) (string, error) {
 }
 
 func reportRemoteProxyResult(poolURL, proxyURL string, success bool) {
+	poolURL = normalizePoolURL(poolURL)
 	if poolURL == "" || proxyURL == "" {
 		return
 	}
@@ -185,12 +202,57 @@ func reportRemoteProxyResult(poolURL, proxyURL string, success bool) {
 	}()
 }
 
+func parseRemoteProxyItems(bodyBytes []byte) ([]RemoteProxyItem, error) {
+	bodyBytes = bytes.TrimSpace(bodyBytes)
+	if len(bodyBytes) == 0 {
+		return nil, errors.New("empty response body")
+	}
+
+	var items []RemoteProxyItem
+	if err := json.Unmarshal(bodyBytes, &items); err == nil && len(items) > 0 {
+		return items, nil
+	}
+
+	var strList []string
+	if err := json.Unmarshal(bodyBytes, &strList); err == nil && len(strList) > 0 {
+		for _, s := range strList {
+			items = append(items, RemoteProxyItem{URL: s})
+		}
+		return items, nil
+	}
+
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(bodyBytes, &rawMap); err == nil {
+		for _, k := range []string{"proxies", "items", "data", "list", "proxies_list"} {
+			if sub, ok := rawMap[k]; ok {
+				if parsed, err := parseRemoteProxyItems(sub); err == nil && len(parsed) > 0 {
+					return parsed, nil
+				}
+			}
+		}
+	}
+
+	lines := strings.Split(string(bodyBytes), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && validateProxyURL(line) == nil {
+			items = append(items, RemoteProxyItem{URL: line})
+		}
+	}
+	if len(items) > 0 {
+		return items, nil
+	}
+
+	return nil, errors.New("failed to parse proxy list (unsupported format)")
+}
+
 func syncRemoteProxies(poolURL string) (int, error) {
+	poolURL = normalizePoolURL(poolURL)
 	if poolURL == "" {
 		return 0, errors.New("remote pool url is empty")
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
-	reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy/all"
+	reqURL := poolURL + "/api/proxy/all"
 	resp, err := client.Get(reqURL)
 	if err != nil {
 		return 0, fmt.Errorf("failed to fetch proxies: %w", err)
@@ -199,9 +261,15 @@ func syncRemoteProxies(poolURL string) (int, error) {
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("remote pool HTTP %d", resp.StatusCode)
 	}
-	var items []RemoteProxyItem
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
-		return 0, fmt.Errorf("failed to decode response: %w", err)
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	items, err := parseRemoteProxyItems(bodyBytes)
+	if err != nil {
+		return 0, err
 	}
 
 	imported := 0
@@ -238,14 +306,15 @@ func syncRemoteProxies(poolURL string) (int, error) {
 }
 
 func testRemoteProxyPool(poolURL string) (map[string]interface{}, error) {
+	poolURL = normalizePoolURL(poolURL)
 	if poolURL == "" {
 		return nil, errors.New("remote pool url is empty")
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
-	reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy/stats"
+	reqURL := poolURL + "/api/proxy/stats"
 	resp, err := client.Get(reqURL)
 	if err != nil {
-		reqURL = strings.TrimRight(poolURL, "/") + "/health"
+		reqURL = poolURL + "/health"
 		resp2, err2 := client.Get(reqURL)
 		if err2 != nil {
 			return nil, fmt.Errorf("failed to connect to pool: %w", err)

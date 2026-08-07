@@ -79,3 +79,30 @@ func TestDynamicProxyPoolClient(t *testing.T) {
 		t.Fatalf("expected reportRemoteProxyResult to be called")
 	}
 }
+
+func TestParseRemoteProxyItems(t *testing.T) {
+	// 测试多种格式解析
+	jsonArr := []byte(`[{"url":"socks5://1.1.1.1:1080"},{"url":"http://2.2.2.2:8080"}]`)
+	items, err := parseRemoteProxyItems(jsonArr)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("failed jsonArr parse: %v, %v", err, items)
+	}
+
+	strArr := []byte(`["socks5://1.1.1.1:1080", "http://2.2.2.2:8080"]`)
+	items, err = parseRemoteProxyItems(strArr)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("failed strArr parse: %v, %v", err, items)
+	}
+
+	objWrap := []byte(`{"proxies":["socks5://1.1.1.1:1080", "http://2.2.2.2:8080"]}`)
+	items, err = parseRemoteProxyItems(objWrap)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("failed objWrap parse: %v, %v", err, items)
+	}
+
+	textLines := []byte("socks5://1.1.1.1:1080\nhttp://2.2.2.2:8080")
+	items, err = parseRemoteProxyItems(textLines)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("failed textLines parse: %v, %v", err, items)
+	}
+}

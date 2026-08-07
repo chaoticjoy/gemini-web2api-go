@@ -447,6 +447,7 @@ const pages = {
           </h2>
           <select id="testProxy" style="width:100%">
             <option value="">自动选择（按调度规则）</option>
+            <option value="dynamic">⚡ 动态代理池服务 (实时申请测试)</option>
             <option value="0">直连主机 IP</option>
           </select>
           <p class="hint" style="margin-top:10px">
@@ -1253,8 +1254,8 @@ async function doLogout() {
 async function populateTestProxies() {
   const sel = document.getElementById('testProxy');
   if (!sel) return;
-  // 清掉旧的代理选项（保留前两个固定项）
-  while (sel.options.length > 2) sel.remove(2);
+  // 清掉旧的静态代理选项（保留前三个固定项）
+  while (sel.options.length > 3) sel.remove(3);
   try {
     const data = await api('/admin/api/proxies');
     (data.items || []).filter(p => p.enabled).forEach(p => {

@@ -602,19 +602,33 @@ func handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	var proxyURL, proxyName string
 	var proxyID int64
 	useDirect := false
-	if proxyIDStr == "" {
-		// 自动模式：仿照 acquireSlot 优先代理池里第一个 enabled
-		for _, p := range listProxies() {
-			if p.Enabled && p.FailCount < 5 {
-				proxyURL = p.URL
-				proxyName = p.Name
-				proxyID = p.ID
-				break
+	if proxyIDStr == "" || proxyIDStr == "dynamic" {
+		// 1. 先试本地代理池
+		if proxyIDStr == "" {
+			for _, p := range listProxies() {
+				if p.Enabled && p.FailCount < 5 {
+					proxyURL = p.URL
+					proxyName = p.Name
+					proxyID = p.ID
+					break
+				}
 			}
 		}
-		if proxyURL == "" {
+		// 2. 如果没有本地代理或显式指定 dynamic，尝试从动态代理池获取
+		if proxyURL == "" && rtCfg().ProxyPoolURL != "" {
+			if pURL, err := fetchRemoteProxy(rtCfg().ProxyPoolURL); err == nil && pURL != "" {
+				proxyURL = pURL
+				proxyName = "Dynamic (" + pURL + ")"
+				proxyID = getDynamicSlotID(pURL)
+			}
+		}
+		// 3. 直连
+		if proxyURL == "" && proxyIDStr != "dynamic" {
 			useDirect = true
 			proxyName = "直连"
+		} else if proxyURL == "" && proxyIDStr == "dynamic" {
+			writeJSON(w, 400, map[string]string{"error": "无法从动态代理池获取可用代理或未配置 proxy_pool_url"})
+			return
 		}
 	} else {
 		var err error
