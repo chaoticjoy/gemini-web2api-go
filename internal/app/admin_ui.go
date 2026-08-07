@@ -31,6 +31,7 @@ func handleAdminUI(w http.ResponseWriter, r *http.Request) {
 	stat, _ := f.Stat()
 	data := make([]byte, stat.Size())
 	f.Read(data)
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	switch {
 	case len(path) > 5 && path[len(path)-5:] == ".html":
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
