@@ -172,7 +172,7 @@ func acquireSlot() (Proxy, bool, error) {
 
 	if hasProxies || rtCfg().ProxyPoolURL != "" {
 		// 代理池或动态代理配置存在，但未拿到可用代理 → 不退回直连（避免直连 IP 被封）
-		return Proxy{}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+		return Proxy{ID: -1, Name: "代理池(满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 	}
 
 	// 3. 没配代理池 → 用直连 slot（id=0）
@@ -267,7 +267,10 @@ func streamGenerate(prompt string, mc ModelConfig,
 	// 通过限流器拿一个 slot（代理或直连）。所有 slot 满 → 直接 429。
 	picked, slotOK, slotErr := acquireSlot()
 	if !slotOK {
-		return nil, slotErr
+		return &StreamResult{
+			ProxyID:   picked.ID,
+			ProxyName: picked.Name,
+		}, slotErr
 	}
 	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
 
