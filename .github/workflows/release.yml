@@ -27,9 +27,9 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME#v}"
           # 用 sed 不用 grep -oP：-P 依赖 PCRE 且在非 UTF-8 locale 下直接罢工
-          code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' server.go)
-          echo "tag=$tag  server.go=$code"
-          [ "$tag" = "$code" ] || { echo "::error::tag $tag 与 server.go 里的 $code 不一致"; exit 1; }
+          code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/app/server.go)
+          echo "tag=$tag  internal/app/server.go=$code"
+          [ "$tag" = "$code" ] || { echo "::error::tag $tag 与 internal/app/server.go 里的 $code 不一致"; exit 1; }
 
       - run: go test ./...
 
@@ -50,18 +50,34 @@ jobs:
           done
           cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
+      # 从 CHANGELOG.md 抽出本 tag 对应的那一节，拼进 Release 说明。
+      # 抽法：从 `## <版本号>` 那行的下一行起，到下一个 `## ` 之前。
+      # 抽不到（没写 CHANGELOG）就留空，靠下面 generate_release_notes 的提交列表兜底。
+      - name: Build release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          {
+            echo "单二进制，下载对应平台的那个直接跑，不需要 Go 也不需要 Docker："
+            echo
+            echo '```bash'
+            echo 'chmod +x gemini-web2api-go_*'
+            echo './gemini-web2api-go_* --port 8083 --admin-token your-admin-token'
+            echo '```'
+            echo
+            echo "容器部署见 \`ghcr.io/${{ github.repository }}\`。校验完整性用 \`SHA256SUMS.txt\`。"
+            section=$(awk -v v="$ver" '$0=="## "v{f=1;next} /^## /{f=0} f' CHANGELOG.md)
+            if [ -n "$section" ]; then
+              echo
+              echo "## 本版更新"
+              echo "$section"
+            fi
+          } > release_body.md
+          cat release_body.md
+
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: dist/*
           generate_release_notes: true
-          body: |
-            单二进制，下载对应平台的那个直接跑，不需要 Go 也不需要 Docker：
-
-            ```bash
-            chmod +x gemini-web2api-go_*
-            ./gemini-web2api-go_* --port 8083 --admin-token your-admin-token
-            ```
-
-            容器部署见 `ghcr.io/${{ github.repository }}`。
-            校验文件完整性用 `SHA256SUMS.txt`。
+          body_path: release_body.md

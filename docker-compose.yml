@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
 
     # ── 这里只放"改了必须重启进程"的东西 ──────────────────────────────────
-    # 调优参数（限流额度、重试、超时、默认模型、TLS 指纹、bl 版本、静态代理、
+    # 调优参数（限流额度、重试、超时、默认模型、TLS 指纹、bl 版本、降级开关、
     # 日志开关、保留天数）在管理面板「设置 → 运行时配置」里改，保存即生效。
     # 凭证（API Key、Google Cookie）也在面板里管，存数据库。
     # 下面的 API_KEY / cookie 挂载都是**可选的锁定开关**，给不希望运行时被改
@@ -23,8 +23,14 @@ services:
     # 然后让其他容器加入下面的 default network 或自定义 network。
 
     volumes:
-      - ./data:/data                              # SQLite + 历史记录持久化
-      # - ./cookie.txt:/app/cookie.txt:ro         # 可选：面板没存 cookie 时的兜底文件
+      # 用具名卷而不是 ./data:/data —— 镜像以 nonroot(uid 65532) 运行，而 bind mount
+      # 会用宿主目录的属主盖掉镜像里 /data 的属主。宿主上目录不存在时 Docker 自动建、
+      # 属主是 root，容器就写不进去，报 `unable to open database file (14)`。
+      # 具名卷由 Docker 从镜像继承属主，不会踩这个坑。
+      - gw2a-data:/data                           # SQLite + 历史记录持久化
+      # 一定要用 bind mount 的话，先把属主改过来：sudo chown -R 65532:65532 ./data
+      # - ./data:/data
+      # - ./cookie.txt:/app/cookie.txt:ro         # 可选：启动时把这个文件导入 Cookie 池
 
     environment:
       # 面板登录 token。留空 = 面板不鉴权，只有在绑定 127.0.0.1 时才可接受。
@@ -49,3 +55,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  gw2a-data:

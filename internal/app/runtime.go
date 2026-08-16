@@ -27,9 +27,25 @@ type RuntimeConfig struct {
 	Impersonate     string `json:"impersonate"`
 	GeminiBL        string `json:"gemini_bl"`
 	Proxy           string `json:"proxy"`
-	ProxyPoolURL   string `json:"proxy_pool_url"`
-	ProxyMode      string `json:"proxy_mode"`
-	ProxyStrategy  string `json:"proxy_strategy"`
+	ProxyPoolURL    string `json:"proxy_pool_url"`
+	ProxyMode       string `json:"proxy_mode"`
+	ProxyStrategy   string `json:"proxy_strategy"`
+
+	// ProxyCooldownMin 是代理连续失败熔断后隔多久放回池子，单位分钟。
+	// 0 = 不恢复（熔断即永久除名，要手动重置）。默认按实测的封禁恢复时长取 120。
+	ProxyCooldownMin int `json:"proxy_cooldown_min"`
+	// FallbackDirect 决定代理池一个出口都用不上时是退回直连还是直接 429。
+	// 默认 false：配了代理池就意味着不想暴露本机 IP，悄悄直连会把这个前提废掉。
+	FallbackDirect bool `json:"fallback_direct"`
+	// FallbackAnon 决定 cookie 失效时是降级成匿名继续跑还是直接报错。
+	// 默认 false：匿名档拿不到 3.1 Pro / 扩展思考 / 生图，降级了客户端也看不出来。
+	FallbackAnon bool `json:"fallback_anon"`
+	// GeminiBLAuto 决定是否定期从 /app 页面抓最新的 bl 版本号覆盖上面钉死的值。
+	GeminiBLAuto bool `json:"gemini_bl_auto"`
+	// MaxPromptBytes 是单次请求 prompt 的 UTF-8 字节上限，超了直接报错。
+	// 单位是字节不是 token：实测上游的墙按字节走，跟语言无关，见 messages.go。
+	// 0 = 关掉检查（原样发出，由上游从尾部静默截断）。
+	MaxPromptBytes int `json:"max_prompt_bytes"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -55,9 +71,15 @@ func initRuntimeConfig() {
 		Impersonate:     cfg.Impersonate,
 		GeminiBL:        cfg.GeminiBL,
 		Proxy:           cfg.Proxy,
-		ProxyPoolURL:   cfg.ProxyPoolURL,
-		ProxyMode:      cfg.ProxyMode,
-		ProxyStrategy:  cfg.ProxyStrategy,
+		ProxyPoolURL:    cfg.ProxyPoolURL,
+		ProxyMode:       cfg.ProxyMode,
+		ProxyStrategy:   cfg.ProxyStrategy,
+
+		ProxyCooldownMin: cfg.ProxyCooldownMin,
+		FallbackDirect:   cfg.FallbackDirect,
+		FallbackAnon:     cfg.FallbackAnon,
+		GeminiBLAuto:     cfg.GeminiBLAuto,
+		MaxPromptBytes:   cfg.MaxPromptBytes,
 	}
 	if base.ProxyMode == "" {
 		base.ProxyMode = "auto"
@@ -106,6 +128,8 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		{"per_ip_rpm", c.PerIPRPM, 0, 10000},
 		{"per_ip_rph", c.PerIPRPH, 0, 100000},
 		{"retention_days", c.RetentionDays, 1, 3650},
+		{"proxy_cooldown_min", c.ProxyCooldownMin, 0, 10080},
+		{"max_prompt_bytes", c.MaxPromptBytes, 0, 10000000},
 	} {
 		if r.v < r.min || r.v > r.max {
 			return fmt.Errorf("%s=%d 超出允许范围 [%d, %d]", r.name, r.v, r.min, r.max)

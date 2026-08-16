@@ -28,6 +28,8 @@ var (
 
 type xsrfEntry struct {
 	token   string
+	pushID  string // 上传文件用的 Push-ID 头
+	pctx    string // 上传文件用的 X-Client-Pctx 头
 	fetched time.Time
 }
 
@@ -35,6 +37,11 @@ type xsrfEntry struct {
 const xsrfTTL = 20 * time.Minute
 
 var snlm0eRe = regexp.MustCompile(`"SNlM0e":"([^"]{10,200})"`)
+
+// 上传要的两个页面参数，跟 XSRF token 同页取，省一次页面请求。
+var pushIDRe = regexp.MustCompile(`"qKIAYe":"([^"]{4,400})"`)
+
+var pctxRe = regexp.MustCompile(`"Ylro7b":"([^"]{4,400})"`)
 
 // cookieKey 用 cookie 的短摘要当缓存键，避免把整串凭证塞进 map key。
 func cookieKey(cookie string) string {
@@ -67,32 +74,56 @@ func getXSRF(cookie, proxyURL string) (string, error) {
 	}
 	xsrfMu.Unlock()
 
-	token, err := fetchXSRF(cookie, proxyURL)
+	e, err := fetchAppTokens(cookie, proxyURL)
 	if err != nil {
 		return "", err
 	}
 	xsrfMu.Lock()
-	xsrfCache[key] = xsrfEntry{token: token, fetched: time.Now()}
+	xsrfCache[key] = e
 	xsrfMu.Unlock()
-	return token, nil
+	return e.token, nil
 }
 
-// fetchXSRF 抓 /app 页面从 HTML 里抠 SNlM0e。
+// getUploadTokens 取上传要用的 Push-ID / X-Client-Pctx，跟 XSRF token 同一份缓存。
+func getUploadTokens(cookie, proxyURL string) (pushID, pctx string, err error) {
+	key := cookieKey(cookie)
+
+	xsrfMu.Lock()
+	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
+		xsrfMu.Unlock()
+		return e.pushID, e.pctx, nil
+	}
+	xsrfMu.Unlock()
+
+	e, err := fetchAppTokens(cookie, proxyURL)
+	if err != nil {
+		return "", "", err
+	}
+	xsrfMu.Lock()
+	xsrfCache[key] = e
+	xsrfMu.Unlock()
+	return e.pushID, e.pctx, nil
+}
+
+// fetchAppPage 抓 gemini.google.com/app 的 HTML。
 // 走跟主请求相同的出口：配了代理走 stdlib，没配走 tls-client，
-// 免得 token 和后续请求来自两个不同 IP。
-func fetchXSRF(cookie, proxyURL string) (string, error) {
+// 免得页面里取到的 token 和后续请求来自两个不同 IP。
+// cookie 传空串就是匿名抓（页面照样返回，只是没有登录态字段）。
+func fetchAppPage(cookie, proxyURL string) ([]byte, error) {
 	const pageURL = "https://gemini.google.com/app"
 	headers := map[string]string{
 		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 		"Accept-Language": "en-US,en;q=0.9",
-		"Cookie":          cookie,
+	}
+	if cookie != "" {
+		headers["Cookie"] = cookie
 	}
 
 	var body []byte
 	if proxyURL != "" {
 		req, err := http.NewRequest("GET", pageURL, nil)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		applyChromeHeaders(req)
 		for k, v := range headers {
@@ -100,44 +131,60 @@ func fetchXSRF(cookie, proxyURL string) (string, error) {
 		}
 		resp, err := getStdlibClient(proxyURL).Do(req)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return "", fmt.Errorf("fetch XSRF page: HTTP %d", resp.StatusCode)
+			return nil, fmt.Errorf("fetch /app: HTTP %d", resp.StatusCode)
 		}
 		body, err = io.ReadAll(resp.Body)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	} else {
 		req, err := fhttp.NewRequest("GET", pageURL, nil)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
 		resp, err := getTLSClient().Do(req)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return "", fmt.Errorf("fetch XSRF page: HTTP %d", resp.StatusCode)
+			return nil, fmt.Errorf("fetch /app: HTTP %d", resp.StatusCode)
 		}
 		body, err = io.ReadAll(resp.Body)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	}
+	return body, nil
+}
 
-	m := snlm0eRe.FindSubmatch(body)
-	if m == nil {
-		// 页面拿到了却没有 token，最可能是 cookie 已失效被当成匿名用户。
-		return "", fmt.Errorf("no SNlM0e in page (cookie expired or not signed in)")
+// fetchAppTokens 抓一次 /app 页面，把三个 token 一起抠出来。
+func fetchAppTokens(cookie, proxyURL string) (xsrfEntry, error) {
+	body, err := fetchAppPage(cookie, proxyURL)
+	if err != nil {
+		return xsrfEntry{}, err
 	}
-	return string(m[1]), nil
+	e := xsrfEntry{fetched: time.Now()}
+	if m := snlm0eRe.FindSubmatch(body); m != nil {
+		e.token = string(m[1])
+	} else if cookie != "" {
+		// 带 cookie 却拿不到 token = cookie 已失效被当成匿名。匿名本就没这字段，不算错。
+		return xsrfEntry{}, fmt.Errorf("no SNlM0e in page (cookie expired or not signed in)")
+	}
+	if p := pushIDRe.FindSubmatch(body); p != nil {
+		e.pushID = string(p[1])
+	}
+	if p := pctxRe.FindSubmatch(body); p != nil {
+		e.pctx = string(p[1])
+	}
+	return e, nil
 }
 
 // isXSRFError 判断上游 400 是不是 XSRF token 的问题。

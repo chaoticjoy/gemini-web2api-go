@@ -24,6 +24,23 @@ const (
 	hexPro31     = "9d8ca3786ebdfbea" // 3.1 Pro
 )
 
+// innerSlots 是 payload 里 inner 数组的长度。浏览器发 97-98 槽，我们原来只开 80，
+// 于是 inner[80]（扩展思考）连位置都没有、想填也填不进去。
+//
+// 加长本身是安全的：曾经把它从 80 加到 102 来试 inner[79] 会不会复活，结论是不会
+// —— 模型选择完全由 x-goog-ext-525001261-jspb header 决定，长度不影响。
+const innerSlots = 97
+
+// inner[80] / 模型 header 下标 15 的取值：1=普通，2=扩展思考。
+//
+// **只在登录态生效**：匿名请求带上它服务端静默忽略，回报的仍是普通模型、思考链 0
+// 字符（对齐登录态抓包参数复测 3 组，8 次全灭）。所以带这个的模型跟 3.1 Pro 一样，
+// 没 cookie 时不暴露。
+const (
+	thinkingNormal   = 1
+	thinkingExtended = 2
+)
+
 // ModelConfig holds the server-side model id plus the legacy MODE_CATEGORY value.
 type ModelConfig struct {
 	// HexID 走 x-goog-ext-525001261-jspb header，是服务端唯一认的模型开关。
@@ -32,6 +49,14 @@ type ModelConfig struct {
 	HexID string
 	Mode  int
 	Desc  string
+	// Thinking 为真时填 inner[80]=2，即网页 UI 上的「扩展思考」。跟 HexID 正交
+	// —— 三个模型都能开，不是某个专属模型。
+	Thinking bool
+	// Tool 非 0 时填 inner[49]，让服务端换后端模型生成媒体产物（14=生图 Nano Banana
+	// / 21=音乐 Lyria）。产物不在 StreamGenerate 响应里，要再走 hNvQHb 拿下载链、
+	// 用下载 host 认的 cookie 子集下回原始字节，见 media.go。跟登录态绑定：匿名请求
+	// 这个会被静默降级成一句「Are you signed in?」文本。
+	Tool int
 }
 
 // 只暴露服务端清单（batchexecute?rpcids=otAQ7b）里真实存在的模型。
@@ -42,16 +67,23 @@ var Models = map[string]ModelConfig{
 	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Desc: "Latest all-around model"},
 	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Desc: "Fastest, lightweight"},
 	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
+
+	// 扩展思考版。inner[80]=2 跟模型 hex 正交，三个模型都能开；但只在登录态生效，
+	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
+	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
+	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
+
+	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
+	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
+	"gemini-image": {HexID: hexFlash36, Mode: 1, Tool: toolImage, Desc: "Image generation (Nano Banana); returns a base64 data URL; needs a signed-in cookie"},
+	"gemini-music": {HexID: hexFlash36, Mode: 1, Tool: toolMusic, Desc: "Music generation (Lyria, ~30s); returns a base64 data URL; needs a signed-in cookie"},
 }
 
-// hasCookie 表示是否配置了 Google 账号 cookie。
-// 先看 cookie 池里有没有 enabled 账号，再回落到旧的单 cookie（面板 kv 或
-// --cookie-file）——面板里加了账号要立刻反映出来。
+// hasCookie 表示 cookie 池里有没有可用账号。决定 3.1 Pro 是否出现在模型列表里。
 func hasCookie() bool {
-	if _, enabled := accountCount(); enabled > 0 {
-		return true
-	}
-	return currentCookieRaw() != ""
+	_, enabled := accountCount()
+	return enabled > 0
 }
 
 // availableModels 返回当前配置下值得暴露的模型。
@@ -69,7 +101,7 @@ func availableModels() map[string]ModelConfig {
 	}
 	out := make(map[string]ModelConfig, len(Models))
 	for k, v := range Models {
-		if k == "gemini-3.1-pro" {
+		if k == "gemini-3.1-pro" || v.Thinking || v.Tool > 0 {
 			continue
 		}
 		out[k] = v
@@ -89,12 +121,15 @@ func resolveModel(modelName string) (string, ModelConfig, error) {
 	}
 	mc, ok := availableModels()[modelName]
 	if !ok {
-		if _, exists := Models[modelName]; exists && !hasCookie() {
+		if full, exists := Models[modelName]; exists && !hasCookie() {
+			downgrade := "are silently downgraded to 3.5 Flash-Lite"
+			if full.Tool > 0 {
+				downgrade = "are silently downgraded to a plain \"Are you signed in?\" text reply"
+			}
 			return "", ModelConfig{}, fmt.Errorf(
 				"%s is unavailable without a Google account cookie: anonymous requests for it "+
-					"are silently downgraded to 3.5 Flash-Lite. Add a cookie in the admin panel "+
-					"(Settings) or via --cookie-file to enable it",
-				modelName)
+					"%s. Add a cookie in the admin panel (Cookie pool) or via --cookie-file to enable it",
+				modelName, downgrade)
 		}
 		return "", ModelConfig{}, fmt.Errorf("unknown model: %s", modelName)
 	}
@@ -117,8 +152,17 @@ type StreamResult struct {
 	UpstreamModel string
 	ProxyID       int64
 	ProxyName     string
-	TTFBMs        int64
-	TotalMs       int64
+	// 用了 cookie 池里的哪个账号，0 = 匿名。失败的请求也要带上——
+	// 排查"加了 cookie 就大面积失败"时，最需要知道的正是失败那条用的哪个号。
+	AccountID    int64
+	AccountLabel string
+	TTFBMs       int64
+	TotalMs      int64
+	// Artifacts 是媒体模型（生图/音乐）取回的产物原始字节，非媒体模型为空。
+	Artifacts []MediaArtifact
+	// MediaErr 记媒体产物取回失败的原因：生成本身 200 了、但走 hNvQHb / 下载那步挂了。
+	// 调用方据此报错，而不是返回一个只有文字没有图的「半成功」。
+	MediaErr string
 }
 
 // RateLimitError 表示所有 IP slot 都达到了限流上限。
@@ -173,7 +217,7 @@ func fetchOrStickyRemoteProxy(poolURL string) (Proxy, bool) {
 // 全满返回 *RateLimitError。
 //
 // 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
-func acquireSlot() (Proxy, bool, error) {
+func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 	mode := rtCfg().ProxyMode
 	if mode == "" {
 		mode = "auto"
@@ -195,7 +239,7 @@ func acquireSlot() (Proxy, bool, error) {
 
 	case "static_only":
 		if hasProxies {
-			if p, ok := pickProxyWithCapacity(); ok {
+			if p, ok := pickProxyPreferring(preferProxyID); ok {
 				return p, true, nil
 			}
 		}
@@ -212,7 +256,7 @@ func acquireSlot() (Proxy, bool, error) {
 	case "pool_only":
 		// 代理优先模式：先试静态，再试动态，绝不直连
 		if hasProxies {
-			if p, ok := pickProxyWithCapacity(); ok {
+			if p, ok := pickProxyPreferring(preferProxyID); ok {
 				return p, true, nil
 			}
 		}
@@ -225,7 +269,7 @@ func acquireSlot() (Proxy, bool, error) {
 
 	default: // "auto" 自动混合模式
 		if hasProxies {
-			if p, ok := pickProxyWithCapacity(); ok {
+			if p, ok := pickProxyPreferring(preferProxyID); ok {
 				return p, true, nil
 			}
 		}
@@ -235,7 +279,10 @@ func acquireSlot() (Proxy, bool, error) {
 			}
 		}
 		if hasProxies || hasPoolURL {
-			return Proxy{ID: -1, Name: "代理池(满/不可用)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+			if !rtCfg().FallbackDirect {
+				return Proxy{ID: -1, Name: "代理池(满/不可用)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+			}
+			logf("[proxy] 代理池无可用出口，本次退回直连（fallback_direct 已开）")
 		}
 		ok, reason := trySlotAcquire(0)
 		if ok {
@@ -244,6 +291,10 @@ func acquireSlot() (Proxy, bool, error) {
 		return Proxy{ID: 0, Name: "直连"}, false, &RateLimitError{Reason: reason, ProxyID: 0}
 	}
 }
+
+// 一个请求最多试几个 cookie。池子大时挨个试到底会让失败请求拖很久，
+// 而连试 3 个都不行基本说明是池子整体的问题，不是撞上个别坏号。
+const maxCookieTries = 3
 
 // releaseSlot 释放占用。proxyID=0 表示直连。
 func releaseSlot(proxyID int64) {
@@ -266,10 +317,203 @@ func (d *deltaTracker) Push(fullText string) string {
 
 // streamGenerate POSTs to Gemini's StreamGenerate endpoint and returns raw body
 // plus proxy/timing telemetry for the metrics layer.
-func streamGenerate(prompt string, mc ModelConfig,
+// The 80-slot inner array is verbatim from the Python reference.
+// onDelta 非 nil 时开启真流式：上游每写一帧就解析一次，跟已发出的内容做前缀
+// diff，把新增部分立刻回调出去。上游每帧带的是累积全文而不是增量，diff 必须
+// 自己做。一旦已经吐过内容就不再重试——重试会让客户端收到重复文本。
+func streamGenerate(prompt, latest string, mc ModelConfig,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
-	inner := make([]interface{}, 80)
-	inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
+	return streamGenerateWithFiles(prompt, latest, mc, nil, onDelta, onReasoning)
+}
+
+// fileRef 是一个已上传附件的引用。
+type fileRef struct {
+	Ref  string // 上传返回的路径，形如 /contrib_service/ttl_1d/…
+	Name string // 展示给模型看的文件名
+	Kind int    // 附件类型：1=图片，3=文本/普通文件
+	Mime string // 内容类型，服务端按它决定怎么解析附件
+}
+
+// streamGenerateWithFiles 同上，但可以带附件。
+//
+// 附件填 inner[0][3]，形状 [[[ref, 1], "文件名"], …]。附件只在登录态可用：
+// 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
+func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string)) (*StreamResult, error) {
+	var files []fileRef
+
+	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
+	// 否则一个号在几十个出口之间跳，在 Google 眼里就是账号共享的特征。
+	//
+	// 挑号排在 acquireSlot 之前不违反「取 XSRF 必须走正式出口」：挑号只读库、
+	// 不发请求，真正发请求的是下面的 getXSRF，它在拿到 slot 之后。
+	var acct *CookieAccount
+	if a, ok := pickCookieAccount(); ok {
+		acct = a
+	}
+	preferProxy := int64(0)
+	if acct != nil {
+		preferProxy = acct.ProxyID
+	}
+
+	// 出错时也要把「用了哪个号 / 哪个出口」带回去，否则失败记录里全是空白。
+	// picked 是拿到 slot 之后才填的，闭包捕获它，后面每次 attrib 都带上当时的出口。
+	var picked Proxy
+	var cookieID int64
+	var cookieLabel string
+	attrib := func(err error) (*StreamResult, error) {
+		return &StreamResult{
+			AccountID: cookieID, AccountLabel: cookieLabel,
+			ProxyID: picked.ID, ProxyName: picked.Name,
+		}, err
+	}
+
+	// 通过限流器拿一个 slot（代理或直连）。所有 slot 满 → 直接 429。
+	p, slotOK, slotErr := acquireSlot(preferProxy)
+	if !slotOK {
+		return attrib(slotErr)
+	}
+	picked = p
+	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
+
+	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
+	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
+	proxyURL := picked.URL
+	pickedOK := picked.ID > 0 // 是否真用了代理池里的代理
+
+	// endpoint 要等出口定下来才能拼：currentBL 可能顺手踢一次后台抓取，
+	// 那个抓取必须跟正式请求走同一个出口，否则配了代理池也会从本机 IP 漏一次。
+	reqid := time.Now().Unix() % 1000000
+	endpoint := fmt.Sprintf(
+		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+		currentBL(proxyURL), reqid,
+	)
+
+	// 取 XSRF token。一个 cookie 失效不该让整个请求失败：当前号取不到就换下一个，
+	// 最多试 maxCookieTries 个。不这么做的话，池子里 2 个号坏 1 个就会让大约一半
+	// 请求挂掉，而每次失败看起来都像上游的问题，用户只会觉得"成功率莫名很低"。
+	//
+	// 换号**不换出口**：出口已经按第一个号的绑定选定了，同一个请求里再换出口没道理。
+	cookieStr, sapisid, xsrfToken := "", "", ""
+	var lastCookieErr error
+	tried := map[int64]bool{}
+	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
+	rotatedOnce := map[int64]bool{}
+	for acct != nil && len(tried) < maxCookieTries {
+		tried[acct.ID] = true
+		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
+		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
+		tok, err := getXSRF(acct.Cookie, proxyURL)
+		if err == nil {
+			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
+			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
+			//
+			// 绝不因为"这次走的是别的出口"就覆盖：出口是按**本次第一个挑中的号**
+			// 的绑定选的，而挑号会换（新加的号 last_used_at=0 排在最前，撞上坏号
+			// 就会换）。拿别人的出口覆盖当前号的绑定，等于每次撞上坏号就把好号的
+			// 粘性打散一次 —— 实测就是这么散掉的。
+			if acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID) {
+				bindAccountProxy(acct.ID, picked.ID)
+			}
+			break
+		}
+		// 取不到 SNlM0e 基本等于这个 cookie 已失效（页面把我们当匿名用户了）。
+		// 换号之前先给它一次机会：强制轮转一次再重取。
+		//
+		// 轮转会把上游刷新的 *SIDCC 合并回来，而 cookie 就是因为一直发旧值才被判成
+		// 过期会话的 —— 陈旧到这一步还能救回来的号，直接换掉等于白白丢一个。
+		// 只试一次，且只在这一轮：救不回来说明不是陈旧问题。
+		if !rotatedOnce[acct.ID] {
+			rotatedOnce[acct.ID] = true
+			if _, rerr := rotateAccount(*acct); rerr == nil {
+				if fresh := accountByID(acct.ID); fresh != nil {
+					if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
+						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
+						acct = fresh
+						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
+						if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
+							bindAccountProxy(fresh.ID, picked.ID)
+						}
+						break
+					}
+				}
+			}
+		}
+		// 救不回来：记一次失败让面板上看得出是哪个号该换了，然后换下一个。
+		markCookieByStatus(acct.ID, 401, err.Error())
+		lastCookieErr = err
+		logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
+		acct, _ = pickCookieAccountExcept(tried) // 取不到时返回 nil，循环自然结束
+	}
+	if lastCookieErr != nil && cookieStr == "" {
+		if !rtCfg().FallbackAnon {
+			// 默认报错而不是降级：cookie 失效后上游不会拒绝，只是把你当匿名用户，
+			// 纯文本请求照样 200 —— 于是 3.1 Pro 被静默降级成 3.5 Flash-Lite、
+			// 思考链消失，客户端完全看不出来。宁可明确失败也不给假的成功。
+			return attrib(fmt.Errorf("cookie 池里 %d 个账号都不可用（最后一个：%w）；"+
+				"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
+				len(tried), lastCookieErr))
+		}
+		logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
+		cookieID, cookieLabel = 0, ""
+	}
+	// 图片附件：上传要 cookie，而且必须走跟正式请求同一个出口，所以排在这里。
+	if len(pending) > 0 {
+		if cookieStr == "" {
+			return attrib(fmt.Errorf("image input needs a Google account cookie: " +
+				"anonymous uploads succeed but referencing them in a conversation is " +
+				"rejected upstream. Add a cookie in the admin panel (Cookie pool)"))
+		}
+		for _, u := range pending {
+			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
+			if uerr != nil {
+				return attrib(fmt.Errorf("上传图片 %s 失败: %w", u.Name, uerr))
+			}
+			files = append(files, fileRef{Ref: ref, Name: u.Name, Kind: u.Kind, Mime: u.Mime})
+		}
+		logf("[vision] 上传了 %d 张图", len(pending))
+	}
+
+	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
+	// 而且必须走跟正式请求同一个出口。
+	budget := rtCfg().MaxPromptBytes
+	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL); ferr != nil {
+		return attrib(ferr)
+	} else if used {
+		prompt = p
+		files = append(files, f...)
+	}
+	if budget > 0 && len(prompt) > budget {
+		return attrib(&PromptTooLongError{
+			Bytes: len(prompt), Budget: budget, HasCookie: cookieStr != "",
+		})
+	}
+
+	inner := make([]interface{}, innerSlots)
+	if len(files) > 0 {
+		// 形状逐字取自浏览器抓包：
+		//   [[[路径, 类型, null, mime], "文件名", null×6, [0]], …]
+		// 类型位是 1=图片 / 3=文本文件 —— 拿 1 传文本文件等于告诉服务端"这是张图"。
+		refs := make([]interface{}, 0, len(files))
+		for _, f := range files {
+			kind := f.Kind
+			if kind == 0 {
+				kind = 3
+			}
+			mime := f.Mime
+			if mime == "" {
+				mime = "text/plain"
+			}
+			refs = append(refs, []interface{}{
+				[]interface{}{f.Ref, kind, nil, mime}, f.Name,
+				nil, nil, nil, nil, nil, nil,
+				[]interface{}{0},
+			})
+		}
+		inner[0] = []interface{}{prompt, 0, nil, refs, nil, nil, 0}
+	} else {
+		inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
+	}
 	inner[1] = []interface{}{"en"}
 	inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
 	inner[6] = []interface{}{0}
@@ -280,12 +524,27 @@ func streamGenerate(prompt string, mc ModelConfig,
 	inner[18] = 0
 	inner[27] = 1
 	inner[30] = []interface{}{4}
-	inner[41] = []interface{}{2}
+	// 抓包里浏览器三种场景（有 cookie / 无 cookie / 扩展思考）全是 [1]。
+	// 我们原来写 [2]，是早期抄来的值、协议层已被证伪。含义仍未知，
+	// 匿名两个值都能通，但没有理由继续偏离浏览器。
+	inner[41] = []interface{}{1}
 	inner[53] = 0
-	inner[59] = uuid.NewString()
+	reqUUID := uuid.NewString()
+	inner[59] = reqUUID
 	inner[61] = []interface{}{}
 	inner[68] = 1
 	inner[79] = mc.Mode
+	inner[80] = thinkingNormal
+	inner[91] = 0
+	inner[96] = 0
+	if mc.Thinking {
+		inner[80] = thinkingExtended
+		inner[96] = 1
+	}
+	// 媒体工具开关。填了服务端就换后端模型出图/出乐（响应里带产物引用，字节要另取）。
+	if mc.Tool > 0 {
+		inner[49] = mc.Tool
+	}
 
 	innerJSON, err := json.Marshal(inner)
 	if err != nil {
@@ -297,14 +556,8 @@ func streamGenerate(prompt string, mc ModelConfig,
 		return nil, err
 	}
 
-	reqid := time.Now().Unix() % 1000000
-	endpoint := fmt.Sprintf(
-		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		rtCfg().GeminiBL, reqid,
-	)
-
-	cookieStr, sapisid, cookieID := loadCookie()
-
+	// 带 cookie 时必须多发一个表单字段 at（XSRF token），否则上游直接 400。
+	// 匿名请求不需要，getXSRF 对空 cookie 返回空串。见 xsrf.go。
 	buildBody := func(at string) string {
 		form := url.Values{}
 		form.Set("f.req", string(outerJSON))
@@ -314,9 +567,21 @@ func streamGenerate(prompt string, mc ModelConfig,
 		return form.Encode()
 	}
 
+	body := buildBody(xsrfToken)
+
+	thinkVal := thinkingNormal
+	if mc.Thinking {
+		thinkVal = thinkingExtended
+	}
+	// 抓包里 header 下标 16 和 inner[59] 是两个不同的 uuid，各生成各的。
+	modelHeader := buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
+	sessionHeader := fmt.Sprintf(`["%s",1]`, reqUUID)
+
+	geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+	geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
+	geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
 	var lastErr error
 	var lastStatus int
-	var lastPicked Proxy
 	xsrfRetried := false
 	t0 := time.Now()
 
@@ -344,58 +609,23 @@ func streamGenerate(prompt string, mc ModelConfig,
 	}
 
 	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		// 每次重试都重新获取一个 slot (切换不同代理)
-		picked, slotOK, slotErr := acquireSlot()
-		if !slotOK {
-			if lastErr != nil {
-				break
+		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+		if len(setCookie) > 0 && cookieID > 0 {
+			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
+				cookieStr = merged
+				updateAccountCookie(cookieID, merged)
 			}
-			return &StreamResult{
-				ProxyID:   picked.ID,
-				ProxyName: picked.Name,
-			}, slotErr
 		}
-		lastPicked = picked
-
-		proxyURL := picked.URL
-		if proxyURL == "" {
-			proxyURL = rtCfg().Proxy
-		}
-		pickedOK := picked.ID != 0
-
-		xsrfToken, xerr := getXSRF(cookieStr, proxyURL)
-		if xerr != nil {
-			lastErr = fmt.Errorf("取 XSRF 凭证失败(%s): %v", picked.Name, xerr)
-			if pickedOK {
-				recordProxyResult(picked.ID, false, xerr.Error())
-			}
-			releaseSlot(picked.ID)
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d (代理 %s 获取 XSRF 失败, 切换代理): %v", attempt+1, rtCfg().RetryAttempts, picked.Name, xerr)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-				continue
-			}
-			markCookieByStatus(cookieID, 401, xerr.Error())
-			return &StreamResult{
-				ProxyID:   picked.ID,
-				ProxyName: picked.Name,
-			}, fmt.Errorf("cookie 无法使用或代理异常：%w", xerr)
-		}
-		body := buildBody(xsrfToken)
-		geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
-
-		statusCode, raw, ttfb, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
 		if err != nil {
 			lastErr = err
 			if pickedOK {
 				recordProxyResult(picked.ID, false, err.Error())
 			}
-			releaseSlot(picked.ID)
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d (切换代理): %v", attempt+1, rtCfg().RetryAttempts, err)
+				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
@@ -407,7 +637,8 @@ func streamGenerate(prompt string, mc ModelConfig,
 				if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
 					body = buildBody(tok)
 					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
-					releaseSlot(picked.ID)
+					geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
+					geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
 					attempt--
 					continue
 				}
@@ -417,12 +648,34 @@ func streamGenerate(prompt string, mc ModelConfig,
 			if pickedOK {
 				recordProxyResult(picked.ID, false, lastErr.Error())
 			}
-			releaseSlot(picked.ID)
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
 			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d (HTTP %d, 切换代理): %v", attempt+1, rtCfg().RetryAttempts, statusCode, lastErr)
+				logf("retry %d/%d (HTTP %d): %v", attempt+1, rtCfg().RetryAttempts, statusCode, lastErr)
+				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+			}
+			continue
+		}
+		// HTTP 200 但一个内容帧都没有 —— 上游的瞬时拒绝（响应里那个 1155）。
+		// 它不是限流：干净 IP 间隔 1s 连打 15 次全过、同 IP 并发 10 共 18 次全过、
+		// 打了 60+ 次的 IP 之后照样成功，没有可预测阈值，同样的请求有时成功有时失败。
+		// 重发一次通常就好，所以必须纳入重试——不然一次抖动就变成客户端可见的 502。
+		//
+		// 判据是**有没有内容帧**，不是 BardErrorInfo：正常响应的结束帧里也带错误码
+		// （1096 = 会话未持久化），拿它判错会把每个正常响应都判成失败。
+		if !hasContentFrame(string(raw)) {
+			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
+			if pickedOK {
+				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
+				// 脏出口一天约 9 次），连续踩中说明这个出口该歇了。
+				recordProxyResult(picked.ID, false, lastErr.Error())
+			}
+			if tracker.emitted != "" || rtracker.emitted != "" {
+				break
+			}
+			if attempt < rtCfg().RetryAttempts-1 {
+				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
@@ -432,7 +685,7 @@ func streamGenerate(prompt string, mc ModelConfig,
 		}
 		releaseSlot(picked.ID)
 		markCookieByStatus(cookieID, 200, "")
-		return &StreamResult{
+		result := &StreamResult{
 			Emitted:          tracker.emitted,
 			EmittedReasoning: rtracker.emitted,
 			Raw:              string(raw),
@@ -440,22 +693,37 @@ func streamGenerate(prompt string, mc ModelConfig,
 			UpstreamModel:    extractUpstreamModel(string(raw)),
 			ProxyID:          picked.ID,
 			ProxyName:        picked.Name,
+			AccountID:        cookieID,
+			AccountLabel:     cookieLabel,
 			TTFBMs:           ttfb,
 			TotalMs:          time.Since(t0).Milliseconds(),
-		}, nil
+		}
+		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
+		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。
+		if mc.Tool == toolImage || mc.Tool == toolMusic {
+			mime := "image/png"
+			if mc.Tool == toolMusic {
+				mime = "audio/mpeg"
+			}
+			arts, aerr := fetchMediaArtifacts(
+				mc.Tool, string(raw), extractConversationID(string(raw)),
+				cookieStr, sapisid, xsrfToken, proxyURL, mime)
+			if aerr != nil {
+				logf("[media] 取回产物失败: %v", aerr)
+				result.MediaErr = aerr.Error()
+			} else {
+				result.Artifacts = arts
+				logf("[media] 取回 %d 份产物", len(arts))
+			}
+		}
+		return result, nil
 	}
 
 	if lastErr != nil {
 		markCookieByStatus(cookieID, lastStatus, lastErr.Error())
-		return &StreamResult{
-			ProxyID:   lastPicked.ID,
-			ProxyName: lastPicked.Name,
-		}, lastErr
+		return attrib(lastErr)
 	}
-	return &StreamResult{
-		ProxyID:   lastPicked.ID,
-		ProxyName: lastPicked.Name,
-	}, errors.New("request failed")
+	return attrib(errors.New("request failed"))
 }
 
 // upstreamModelRe 匹配响应帧里服务端自报的模型显示名（帧的 [42] 位）。
@@ -471,6 +739,28 @@ func extractUpstreamModel(raw string) string {
 	return m[len(m)-1][1]
 }
 
+// buildModelHeader 拼 x-goog-ext-525001261-jspb，形状逐槽取自抓包：
+//
+//	[1,null,null,null,"<hex>",null,null,0,[4,5,6,8],null,null,1,null,null,<mode>,<think>,"<uuid>"]
+//	下标                4                8                          14      15       16
+//
+// 下标 14 跟 inner[79] 同值、下标 15 跟 inner[80] 同值 —— 模型和思考模式在 header 和
+// payload 里各存一份。**服务端认的是 header**：只填 inner[80]=2 而 header 留最小形式，
+// 三个模型实测思考链全是 0 字符；这跟模型选择本身"header 压过 inner[79]"是同一个规律。
+//
+// 下标 16 是**另一个** uuid，跟 inner[59] 不是一个值 —— 跟 inner[59] 同值的是
+// x-goog-ext-525005358-jspb。两份抓包都是这个规律，别图省事复用同一个。
+//
+// uuid 留空时退回最小形式（匿名路径不需要这些槽位，少发一截更省事）。
+func buildModelHeader(hexID string, mode, think int, uuid string) string {
+	if uuid == "" {
+		return fmt.Sprintf(`[1,null,null,null,"%s"]`, hexID)
+	}
+	return fmt.Sprintf(
+		`[1,null,null,null,"%s",null,null,0,[4,5,6,8],null,null,1,null,null,%d,%d,"%s"]`,
+		hexID, mode, think, uuid)
+}
+
 // buildGeminiHeaders 准备 StreamGenerate 必需的应用层 header。
 // hexID 决定服务端用哪个模型；留空则服务端一律回落到 3.5 Flash-Lite。
 func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
@@ -482,9 +772,12 @@ func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
 		"Referer":         "https://gemini.google.com/app",
 		"X-Same-Domain":   "1",
 		"X-Goog-AuthUser": "0",
+		// 这两个浏览器每次都发，值是固定的。
+		"x-goog-ext-73010989-jspb": "[0]",
+		"x-goog-ext-73010990-jspb": "[0,0,0]",
 	}
 	if hexID != "" {
-		h["x-goog-ext-525001261-jspb"] = fmt.Sprintf(`[1,null,null,null,"%s"]`, hexID)
+		h["x-goog-ext-525001261-jspb"] = buildModelHeader(hexID, 0, 0, "")
 	}
 	if cookieStr != "" {
 		h["Cookie"] = cookieStr
@@ -497,14 +790,17 @@ func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
 
 // doGeminiRequest 发一次请求到 endpoint。proxyURL 非空走 stdlib（支持 socks5/http），
 // 空走 tls-client（chrome146 真指纹）。返回 (HTTP status, body bytes, err)。
+// 返回值多了 setCookie：服务端几乎每个响应都在刷新 SIDCC / __Secure-1PSIDCC /
+// __Secure-3PSIDCC，浏览器收下再带回去。一直发旧值的客户端会被判定为过期会话，
+// 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
 func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
-	onLine func(string)) (int, []byte, int64, error) {
+	onLine func(string)) (int, []byte, int64, []string, error) {
 	sendAt := time.Now()
 	if proxyURL != "" {
-		// 走 stdlib —— 跟 Kiro-Gogogo 同款 http.ProxyURL 实现，已知能过 socks5/socks5h。
+		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
 		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
 		if err != nil {
-			return 0, nil, 0, err
+			return 0, nil, 0, nil, err
 		}
 		applyChromeHeaders(req)
 		for k, v := range headers {
@@ -513,20 +809,20 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		client := getStdlibClient(proxyURL)
 		resp, err := client.Do(req)
 		if err != nil {
-			return 0, nil, 0, err
+			return 0, nil, 0, nil, err
 		}
 		defer resp.Body.Close()
 		raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
 		if err != nil {
-			return resp.StatusCode, nil, ttfb, err
+			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
 		}
-		return resp.StatusCode, raw, ttfb, nil
+		return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 	}
 
 	// 直连 → tls-client，保留 chrome146 TLS/HTTP2 真指纹
 	req, err := fhttp.NewRequest("POST", endpoint, strings.NewReader(body))
 	if err != nil {
-		return 0, nil, 0, err
+		return 0, nil, 0, nil, err
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -534,14 +830,14 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	client := getTLSClient()
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, 0, err
+		return 0, nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 	raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
 	if err != nil {
-		return resp.StatusCode, nil, ttfb, err
+		return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
 	}
-	return resp.StatusCode, raw, ttfb, nil
+	return resp.StatusCode, raw, ttfb, resp.Header.Values("Set-Cookie"), nil
 }
 
 // readBody 读完整个响应体并原样返回；onLine 非 nil 时每读到一行就回调一次，
@@ -685,6 +981,20 @@ func textsInLine(line string) []string {
 	return texts
 }
 
+// hasContentFrame 判断响应里到底有没有内容帧。
+//
+// 故意不复用 extractResponseText：那个会先 cleanGeminiText 掉代码产物，一个纯代码
+// 产物的回复在它眼里是空的，但那明明是上游正常出了内容。这里只问"有没有帧"，
+// 判断的是链路成没成功，不是内容合不合用。
+func hasContentFrame(raw string) bool {
+	for _, line := range strings.Split(raw, "\n") {
+		if len(textsInLine(line)) > 0 || reasoningInLine(line) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // extractResponseText parses StreamGenerate's wrb.fr stream and returns the
 // last non-empty text chunk (matches Python extract_response_text behavior).
 func extractResponseText(raw string) string {
@@ -733,7 +1043,7 @@ type ProbeResult struct {
 func probeGemini(prompt, proxyURL string) ProbeResult {
 	res := ProbeResult{Impersonate: rtCfg().Impersonate}
 
-	inner := make([]interface{}, 80)
+	inner := make([]interface{}, innerSlots)
 	inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
 	inner[1] = []interface{}{"en"}
 	inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
@@ -745,7 +1055,10 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	inner[18] = 0
 	inner[27] = 1
 	inner[30] = []interface{}{4}
-	inner[41] = []interface{}{2}
+	// 抓包里浏览器三种场景（有 cookie / 无 cookie / 扩展思考）全是 [1]。
+	// 我们原来写 [2]，是早期抄来的值、协议层已被证伪。含义仍未知，
+	// 匿名两个值都能通，但没有理由继续偏离浏览器。
+	inner[41] = []interface{}{1}
 	inner[53] = 0
 	inner[59] = uuid.NewString()
 	inner[61] = []interface{}{}
@@ -763,12 +1076,12 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	reqid := time.Now().Unix() % 1000000
 	endpoint := fmt.Sprintf(
 		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		rtCfg().GeminiBL, reqid,
+		currentBL(proxyURL), reqid,
 	)
 
 	// probe 是旁路探测，不回写 cookie 健康度：它的失败原因跟 cookie 无关。
 	// 但 at 必须带——否则挂了 cookie 之后连通性探测会一直报 400，假报故障。
-	cookieStr, sapisid, _ := loadCookie()
+	cookieStr, sapisid := loadCookie()
 	if tok, e := getXSRF(cookieStr, proxyURL); e == nil && tok != "" {
 		form.Set("at", tok)
 		body = form.Encode()

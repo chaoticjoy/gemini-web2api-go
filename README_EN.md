@@ -37,6 +37,7 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
 **Models**
 - `gemini-3.6-flash` and `gemini-3.5-flash-lite` work anonymously, web search included
 - `gemini-3.1-pro` needs a cookie; every reply carries a reasoning chain
+- Each of the three models has a `-thinking` variant (extended thinking), available with a cookie
   (`reasoning_content`)
 - Every response records which model the backend **actually** used, so silent
   downgrades are visible
@@ -46,7 +47,7 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
 - Per-exit-IP limits: concurrency / RPM / RPH
 - Proxy pool: runtime CRUD, failure circuit breaker, rotation — each proxy is its
   own rate-limit slot
-- Cookie pool: several Google accounts rotated least-recently-used first
+- Cookie pool: several Google accounts rotated least-recently-used first, auto-refreshed and kept alive, each account pinned to its own exit
 
 **Operations**
 - Single binary, cross-compiled for 6 platforms; container image built on distroless
@@ -173,6 +174,38 @@ Every OpenAI-compatible client (Cherry Studio / ChatBox / Open WebUI / dify / Cu
 
 There is also an unauthenticated health check at `GET /` returning `{"status":"ok","version":…,"models":[…]}`.
 
+## MCP (web_search tool)
+
+Besides the OpenAI API, the same process and port also serves an **MCP server** at `/mcp`,
+exposing Gemini's web-grounded **search** as a `web_search` tool. This lets MCP clients
+(Claude Desktop / Claude Code / Cursor) "search the web through Gemini" and get a
+**synthesized answer plus source links** back.
+
+No separate process or deployment — running the backend gives you this. The transport is
+HTTP (Streamable HTTP), so remote clients just point at the URL, reusing the backend's
+account pool / proxy pool / rate limiting. Search works anonymously; no cookie required.
+
+**Client config** (Claude Desktop's `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "gemini-search": {
+      "url": "http://your-server:8083/mcp",
+      "headers": { "Authorization": "Bearer sk-gemini-your-key" }
+    }
+  }
+}
+```
+
+- `url` points at the backend's `/mcp`; locally it's `http://localhost:8083/mcp`.
+- `Authorization` is the same API key as the OpenAI endpoint (shown on the Settings page).
+- Claude Code: `claude mcp add --transport http gemini-search http://localhost:8083/mcp --header "Authorization: Bearer sk-gemini-your-key"`.
+
+The `web_search(query)` tool takes a query/question and returns Gemini's web-grounded
+answer with a `Sources:` list appended. It's the only tool for now (`url_context` — reading
+a specific URL's content — is not implemented yet).
+
 ## Admin panel
 
 `http://localhost:8083/admin`, log in with `--admin-token`.
@@ -180,10 +213,12 @@ There is also an unauthenticated health check at `GET /` returning `{"status":"o
 - **Overview** — 24h KPIs, request volume / P50 latency dual-axis chart, per-model and per-proxy breakdowns, IP rate-limit usage, one-click connectivity check
 - **Requests** — request log (metadata only, no prompt/response content), status/model filters, pagination
 - **Proxy pool** — runtime CRUD, enable/disable, circuit breaker on repeated failures (each proxy is its own IP slot)
-- **Cookie pool** — import multiple signed-in Google accounts; requests rotate through them **least-recently-used first**, falling back to the Settings-page cookie only when the pool is empty. The list shows redacted summaries only (cookie count / key entries / last 4 of SAPISID / failure count)
-- **Settings** — runtime config form (saved settings take effect immediately), API key rotation, cookie paste box, read-only view of deploy-time config
+- **Cookie pool** — import multiple signed-in Google accounts; requests rotate through them **least-recently-used first**. One-click "check" tells you whether an account is still signed in; cookies are auto-refreshed and kept alive every 10 minutes; each account is pinned to its own exit. The list shows redacted summaries only (cookie count / key entries / last 4 of SAPISID / failure count)
+- **Settings** — runtime config form (saved settings take effect immediately), API key rotation, read-only view of deploy-time config
 
 The frontend is a single HTML file and Chart.js is embedded in the binary, **not loaded from a CDN**, so the panel also works on air-gapped or intranet deployments.
+
+**Serving it under a path prefix needs no extra configuration**: every URL in the panel is relative, so forwarding `https://example.com/gemini/` to this service's `/` is enough to open `https://example.com/gemini/admin`. (Requesting `/admin` without the trailing slash 301s to `admin/` — relative URLs resolve against the document URL's *directory*, and the two forms differ by one level, so they have to be normalised first.)
 
 ## Models
 
@@ -194,6 +229,11 @@ Gemini's backend only recognises three models (the list comes from `batchexecute
 | `gemini-3.6-flash` | All-round, default |
 | `gemini-3.5-flash-lite` | Fast and lightweight |
 | `gemini-3.1-pro` | Most capable, **needs a cookie**; every reply carries a reasoning chain |
+| `gemini-3.6-flash-thinking` | 3.6 Flash with extended thinking; **needs a cookie** |
+| `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite with extended thinking; **needs a cookie** |
+| `gemini-3.1-pro-thinking` | 3.1 Pro with extended thinking; **needs a cookie** |
+| `gemini-image` | Image generation (Nano Banana); base64 output; **needs a cookie** |
+| `gemini-music` | Music (Lyria, ~30s); base64 output; **needs a cookie** |
 
 Without a cookie, `/v1/models` returns only the first two, and asking for `gemini-3.1-pro` fails with an explanation. An anonymous request for it is always silently downgraded to 3.5 Flash-Lite — better to fail at model selection than to hand back a reply that "succeeded" but isn't Pro.
 
@@ -234,13 +274,25 @@ you do want to bill for it.
 
 Anonymous calls (no cookie) only reach the two text models above plus Gemini's built-in web search. `gemini-3.1-pro` is silently downgraded to 3.5 Flash-Lite anonymously, which is why it isn't exposed at all in that case.
 
-Image generation, music, video, deep research and canvas need a signed-in session **and are not implemented here** — they require extra tool slots in the request parameter array that this project does not send yet. The panel's "actual model" column always shows which model the backend really used, so any downgrade is visible.
+Attaching a cookie additionally unlocks `gemini-3.1-pro`, **extended thinking for all three models**, **image input**, **a longer context** (over-long conversations are sent as a text attachment, see below), and **image generation (`gemini-image`) / music (`gemini-music`)** (see "Image & music" below).
 
-**Multi-turn context is implemented by flattening `messages` into a single prompt — it is not protocol-level multi-turn.**
+Video, deep research and canvas also need a signed-in session but **are not implemented here**: video is refused for free accounts, deep research is a multi-step async flow — neither is a one-line add. The panel's "actual model" column always shows which model the backend really used, so any downgrade is visible.
 
-Gemini's web app does support protocol-level multi-turn (the browser sends only the new message plus the conversation id, and the history stays server-side); anonymous sessions included. We could not reproduce it. Even after matching the browser's exact format — `inner[2] = [cid, previous rid, "", …, token]`, `inner[17] = [[turn]]`, `f.sid` on the URL — the server still refuses. The one thing we could not reproduce is the botguard token in `inner[3]`: across three captured turns it was 1404 / 1847 / 2489 bytes, generated by browser JS at runtime and out of reach for a plain HTTP client.
+### Image & music
 
-So flattening is the only workable approach today. The cost is resending the whole history each turn, bounded by the single-request input limit.
+`gemini-image` (Nano Banana) and `gemini-music` (Lyria, ~30s) go through `/v1/chat/completions` just like a normal chat — put the image/music description in the user message. The bytes come back as a **base64 data URL** inside `content`: images as `![image](data:image/png;base64,…)`, audio as `[audio](data:audio/mpeg;base64,…)`. Markdown-capable clients render the image inline; to save a file, decode the base64 after the comma.
+
+```bash
+curl http://127.0.0.1:8083/v1/chat/completions \
+  -H "Authorization: Bearer sk-gemini-..." -H "Content-Type: application/json" \
+  -d '{"model":"gemini-image","messages":[{"role":"user","content":"an orange cat in an astronaut helmet"}]}'
+```
+
+Not returning a URL is deliberate — Gemini's artifact links need the cookie to download, so a bare link would be dead on the client side; the server fetches the bytes and inlines them. The base64 is **not counted in `completion_tokens`** (a single image is millions of tokens; billing that downstream would be absurd), only the caption text is. Both need a cookie, so they don't appear in `/v1/models` without one. Params like `size` / `n` have no upstream knob and are ignored.
+
+**Multi-turn context is implemented by flattening `messages` into a single prompt** (the web protocol's native multi-turn needs a token that only a browser JS runtime can produce, which plain HTTP cannot forge). The cost is that every turn resends the whole history, which runs into the single-request length wall: about **130,000 UTF-8 bytes**. Past that the upstream **silently truncates from the tail without an error** — and since the newest message sits at the end, what gets eaten is exactly what you just asked, which reads as "the model suddenly got dumb".
+
+With a cookie, an over-long conversation is uploaded as a `message.txt` attachment instead, which gets around the request-body wall — **but the attachment has a wall of its own**: the model only ever sees about **160,000 bytes** of content in total; anything past that is uploaded but never read (measured with the total size held fixed and only the marker's offset moved: readable at 157,833, not readable at 163,371; splitting into several attachments does not raise the budget). So a cookie takes the usable length from 130K to about 160K — **a genuinely long conversation still has to be compacted by the client**. Without a cookie the request is rejected with 400 `context_length_exceeded` rather than losing data silently.
 
 ## Configuration
 
@@ -254,6 +306,7 @@ Saving takes effect **immediately**, no restart. Values live in the database and
 |---|---|
 | Default model | used when the client doesn't send `model` |
 | Per-slot concurrency / RPM / RPH | rate limits, 0 = unlimited |
+| Prompt byte cap | over the cap: with a cookie the history is sent as a text attachment (usable length up to ~160,000 bytes), without one the request is rejected with 400 `context_length_exceeded`. Neither path truncates silently. Counted in UTF-8 bytes (the upstream limit is byte-based, not token-based), default 128000. 0 = unlimited |
 | Retry attempts / retry delay / upstream timeout | |
 | Detail retention days | only request details expire; aggregates are kept forever |
 | TLS fingerprint | `chrome_146` (default) / `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
@@ -282,7 +335,9 @@ What's left is only what requires restarting the process:
 | Database path | `volumes` + `command: --db` |
 | `ADMIN_TOKEN` | `environment`, the panel login token |
 
-There are two optional **lock switches** for deployments that must not be changed at runtime: the `API_KEY` environment variable pins the API key (the panel can't change it), and the file behind `--cookie-file` acts as a fallback when no cookie is stored in the panel. Without them, both default to the panel.
+The `API_KEY` environment variable pins the API key (the panel can't change it), for deployments that must not be changed at runtime.
+
+`--proxy` and `--cookie-file` are **seed parameters, not a second configuration layer**: at startup their values are imported into the proxy pool / cookie pool (deduplicated by URL and by cookie contents), and everything is managed from the panel afterwards. Change them and restart to take effect.
 
 Command-line flags still work and are meant as temporary overrides during local debugging. Precedence: **panel changes > CLI flags / `config.json` > built-in defaults**.
 
@@ -297,8 +352,8 @@ All flags:
 | `--db` | SQLite path, default `./data/gemini.db` |
 | `--admin-token` | panel login token; empty = no auth (only acceptable when bound to 127.0.0.1) |
 | `--api-key` | pins the `/v1/*` key so the panel can't change it, same as the `API_KEY` env var |
-| `--cookie-file` | fallback cookie file used when the panel has none |
-| `--proxy` | static proxy used when the proxy pool is empty |
+| `--cookie-file` | imports the cookie in this file into the cookie pool at startup |
+| `--proxy` | imports this proxy into the proxy pool at startup |
 | `--impersonate` | TLS fingerprint profile |
 | `--version` | print version and exit (this is what the Docker healthcheck runs) |
 
@@ -308,44 +363,56 @@ Attaching a Google account cookie makes requests run as a signed-in session. Wha
 
 > Signed-in requests must carry an extra XSRF token. The project fetches it from the Gemini page automatically, caches it per cookie and re-fetches on expiry — nothing to configure. (Missing it makes **every** request fail with 400 while anonymous traffic keeps working — an earlier version hit exactly that.)
 
-A signed-in session unlocks image generation (Nano Banana 2), music (Lyria 3), video, deep research, canvas and extended thinking in the web app, but **none of that is implemented here yet**; today a cookie only changes which session the requests belong to.
+A signed-in session unlocks `gemini-3.1-pro` + reasoning chain, image input, and **image generation (`gemini-image`) / music (`gemini-music`)** (see "Image & music" above). Video, deep research and canvas also need a signed-in session but **are not implemented here yet**.
 
 1. Sign in to [gemini.google.com](https://gemini.google.com)
 2. DevTools (F12) → Application → Cookies → `https://gemini.google.com`
 3. Copy: `SID` / `HSID` / `SSID` / `APISID` / `SAPISID` / `__Secure-1PSID`
-4. Paste it into the panel under Settings → Google Cookie (effective on save), or write it to `cookie.txt` and start with `--cookie-file cookie.txt` (the panel wins if both are set):
+4. Add it in the panel under Cookie pool → Add account, or write it to `cookie.txt` and start with `--cookie-file cookie.txt` (imported into the pool at startup, managed from the panel afterwards):
 ```
 SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...
 ```
 
 The JSON form `{"cookie": "SID=...; ...", "sapisid": "..."}` is also accepted. Requests carrying `SAPISID` get a computed `SAPISIDHASH` authorization header, so that entry cannot be missing.
 
-**For multiple accounts use the Cookie pool page.** Each request picks an enabled account least-recently-used first and advances the rotation; the single cookie above is used only when the pool is empty. Either path makes `gemini-3.1-pro` appear in the model list.
+**The Cookie pool page is the only place cookies live.** Each request picks an enabled account least-recently-used first and advances the rotation. As soon as the pool holds an enabled account, `gemini-3.1-pro` appears in the model list.
 
 An account's "failure count" and "last success" columns update automatically. Only **401/403 counts as the cookie's fault** — network errors, proxy failures and Google blocks (302) are excluded, because residential exits degrade often enough that counting them would turn the failure count into proxy noise and make healthy cookies look like the worst offenders.
 
-Note that "last success" only means a request involving this cookie succeeded; it does **not** prove the cookie is still valid. An expired cookie doesn't error — Gemini just treats you as anonymous. To check validity, send one `gemini-3.1-pro` request: a valid cookie reports `3.1 Pro` and returns a reasoning chain, an expired one is downgraded to 3.5 Flash-Lite.
+Note that "last success" only means a request involving this cookie succeeded; it does **not** prove the cookie is still valid. An expired cookie doesn't error — Gemini just treats you as anonymous. Use the **Check** button in the list to tell "still signed in" from "expired/invalid" without spending a real conversation on it.
+
+**Cookies renew themselves.** Nearly every upstream response refreshes `SIDCC` / `__Secure-1PSIDCC` / `__Secure-3PSIDCC` via `Set-Cookie`, and we merge those back into the account; separately, a keepalive ping goes to `accounts.google.com/RotateCookies` every 10 minutes (the interval is dictated by the server). (that response refreshes the same three entries).
+
+**Each account is pinned to its own exit.** If the cookie pool and proxy pool rotated independently, one Google account would emit requests from dozens of different IPs, which is exactly what account sharing looks like to Google. An account binds to the first exit it uses and stays there until that exit becomes unusable.
+
+**A dead account no longer kills the request** — the next account in the pool is tried instead. Otherwise a bigger pool would only mean more ways to hit a bad one.
 
 ## Proxy pool (the core of running this for free)
 
-**Why you need it**: a single IP eventually gets redirected to `google.com/sorry/index`. That threshold is **80-180 requests**, and the wide range is driven by **connection strategy and exit quality, not by how fast you send**:
+**Why you need it**: a single IP sending in bursts eventually gets redirected to `google.com/sorry/index`. That threshold is **80-180 requests**, and the wide range is driven by **connection strategy, exit quality and pacing** together:
 
-| Connection strategy | Concurrency | Pacing | Successful requests when blocked |
-|---|---|---|---|
-| Reused connection pool | 10 | no delay | 151 / 172 / 177 |
-| Reused connection pool | 3 | no delay | 103 / 111 |
-| Fresh connection each time | 10 | no delay | 106 / 109 |
-| Fresh connection each time | 1 | 24s apart | 81 / 166 |
+| Exit | Connection strategy | Concurrency | Pacing | Successful requests when blocked |
+|---|---|---|---|---|
+| residential | Reused connection pool | 10 | no delay | 151 / 172 / 177 |
+| residential | Reused connection pool | 3 | no delay | 103 / 111 |
+| residential | Fresh connection each time | 10 | no delay | 106 / 109 |
+| residential | Fresh connection each time | 1 | 24s apart | 81 / 166 |
+| static | Reused connection pool | 10 | no delay | 188 |
+| static | Reused connection pool | 1 | **10 per minute** | **800, never blocked** |
 
-Only a 302 to `/sorry/` counts as blocked, and every exit was pre-screened. The one clean single-variable comparison is connection strategy: concurrency pinned at 10, both arms started together, each run lasting only 80 seconds (too short for exits to drift) — reused connections reached 172/177, fresh connections 106/109. **Keeping connections alive buys roughly 60% more requests per exit.**
+Only a 302 to `/sorry/` counts as blocked, and every exit was pre-screened.
 
-**Slowing down does not help.** The burst arm spanned 103-177 and the slow arm 81-166 — almost completely overlapping, and the slow arm's own two samples differ by a factor of two. The cause is exits degrading over long runs, not pacing.
+**Connection reuse is worth about 60%**: concurrency pinned at 10, both arms started together, each run lasting only 80 seconds (too short for exits to drift) — reused connections reached 172/177, fresh connections 106/109.
+
+**A steady pace matters more than anything else.** On the same static IP, a burst run was blocked after 188 requests, while a steady 10 requests/minute ran **800 requests over 110 minutes without ever being blocked**. The default `per_ip_rph=80` is therefore a very conservative floor; a deployment that deliberately paces itself can raise it a lot.
+
+> This section previously said "slowing down does not help", based on the burst arm (103-177) and the slow arm (81-166) overlapping almost completely on residential exits. The observation was right but the attribution was wrong: residential exits degrade over long runs (6 of 8 pre-screened exits exceeded a 40% failure rate partway through the slow run), and that degradation swamped the effect of pacing. Once a static IP removes that confound, pacing turns out to matter a great deal.
 
 **Proxy failures consume the budget early**: the dirtier the path, the sooner the block, because some of those "failed" requests did reach Google and were counted (the slow arm actually sent 195 requests to get 166 successes, 17% more than the success count suggests). Don't expect to squeeze out capacity by retrying failures.
 
-**Once blocked, the block is hard.** Two independent re-probes of 30 requests each, 20s apart, spanning about 10 minutes: **60 requests, zero successes**. Recovery time is untested; all we can say is that nothing slipped through within 20 minutes.
+**Once blocked, the block is hard, and it clears after roughly two hours.** Two independent re-probes of 30 requests each, 20s apart, spanning about 10 minutes: **60 requests, zero successes**. Continued probing recovered somewhere between **106 and 121 minutes**. That is where the proxy pool's default 120-minute cooldown comes from.
 
-Control group: 10 IPs × 50 requests each (418 requests) produced zero rejections from Google. The default `per_ip_rph=80` sits at the low end of the measured range and needs no adjustment.
+Control group: 10 IPs × 50 requests each (418 requests) produced zero rejections from Google. The default `per_ip_rph=80` sits at the low end of the measured burst range.
 
 **The fix**: add several proxies on the Proxy pool page. **Each proxy is an independent IP slot** with its own concurrency/RPM/RPH allowance, so N proxies means N times the total capacity.
 
@@ -360,7 +427,7 @@ Supported proxy schemes:
 - 5 failures trip the circuit breaker (resettable from the panel)
 - All proxies full → HTTP 429 (no Google quota consumed; retry once a slot frees up)
 
-**Environment variables `HTTPS_PROXY` / `ALL_PROXY` are ignored.** Proxies come only from the pool or the static proxy setting (`--proxy` / `config.json`). Otherwise a stray `export` on the host would silently change the exit IP while the panel still showed a direct connection, which makes troubleshooting misleading.
+**Environment variables `HTTPS_PROXY` / `ALL_PROXY` are ignored.** Proxies come only from the proxy pool (`--proxy` / `config.json` merely seed the pool at startup). Otherwise a stray `export` on the host would silently change the exit IP while the panel still showed a direct connection, which makes troubleshooting misleading.
 
 ## Fingerprint simulation
 
@@ -398,7 +465,7 @@ This does not change the blocking threshold, though: in a same-start comparison,
 | `n` > 1 | ❌ | Returns 400. Upstream yields a single candidate; silently treating it as 1 would short-change the client |
 | Sampling params | ➖ | `temperature` / `top_p` / `max_tokens` / `stop` / `seed` / `presence_penalty` / `frequency_penalty` are **accepted and ignored, not rejected**. Gemini's web protocol has no such knobs |
 | `response_format` / `logprobs` | ➖ | Not implemented, accepted and ignored |
-| Vision / image input | ❌ | Sending `image_url` returns 400. Anonymous upload **does** work (`content-push.googleapis.com/upload/`, two-step resumable, returns `/contrib_service/ttl_1d/…`), but referencing the uploaded file in a conversation is refused upstream (`BardErrorInfo 1100`); a signed-in session is required |
+| Vision / image input | ⚠️ | **Works with a cookie**: both `image_url` (chat) and `input_image` (responses) are accepted, from `data:` URLs or http(s) links, up to 12MB per image. Anonymous returns 400 — anonymous upload **does** work (`content-push.googleapis.com/upload/`, two-step resumable), but referencing the uploaded file in a conversation is refused upstream (`BardErrorInfo 1100`) |
 | Audio | ❌ | Sending `input_audio` returns 400. The web app has music generation (Lyria 3), signed-in only |
 
 ## Project layout
@@ -419,7 +486,12 @@ internal/app/              everything else
   apikey.go                API key (locked by flag / rotatable from the panel)
   db.go                    SQLite schema: sessions / requests / accounts / kv
   proxy.go                 proxy pool CRUD + capacity scheduling + circuit breaker
-  cookie_pool.go           cookie pool data layer (CRUD + least-recently-used pick + health writeback)
+  cookie_pool.go           cookie pool data layer (CRUD + least-recently-used pick + health writeback + refresh merge)
+  rotate.go                session keepalive (accounts.google.com/RotateCookies, server-dictated interval)
+  upload.go                attachment upload (content-push, two-step resumable)
+  context_file.go          over-long conversations as a text attachment
+  vision.go                image input: data: URL / http(s) link -> pending attachment
+  bl.go                    upstream frontend version (bl) auto-follow
   scheduler.go             hourly/daily aggregation + retention cleanup
   runtime.go               runtime config snapshot (panel edits apply instantly)
   admin.go                 /admin/api/* auth + REST
@@ -434,10 +506,11 @@ docker-compose.yml         single container, pulls the ghcr image by default, sq
 
 ## Limitations
 
-- **Per-IP ceiling**: measured at **80-180 requests** before the sorry-page redirect. The range is that wide because it is driven by **connection strategy and exit quality**, not by how fast you send: at the same concurrency of 10, a reused connection pool reached 172/177 while a fresh connection per request only reached 106/109. `per_ip_rph=80` sits at the bottom of that range → use the proxy pool to scale
-- **Signed-in features**: image generation, music, video, deep research and canvas are not implemented (the protocol is verified to work; what's missing is the request parameter slots)
+- **Per-IP ceiling**: when sending in bursts, measured at **80-180 requests** before the sorry-page redirect (connection reuse buys about 60%: at concurrency 10, a reused pool reached 172/177 versus 106/109 for a fresh connection per request). But **a steady pace barely reaches the ceiling at all** — 10 requests/minute on a static IP ran 800 requests without a block. `per_ip_rph=80` sits at the bottom of the burst range → use the proxy pool to scale, or pace yourself and raise the limit
+- **Signed-in features**: image generation (`gemini-image`) and music (`gemini-music`) are implemented; video, deep research and canvas are not (video is refused for free accounts, deep research is a multi-step async flow)
 - **Function calling**: prompt-level, the model doesn't always answer in the expected format (a real protocol layer isn't available to us)
-- **Multimodal**: unsupported. The web protocol does support image/file upload, image, music and video generation, but all require a signed-in session and none is implemented here
+- **Multimodal**: image input needs a cookie. Image and music generation work with a cookie (`gemini-image` / `gemini-music`); video generation is not implemented
+- **Long context hits two walls**: ~130,000 bytes for the request body and ~160,000 bytes for attachments (the latter is the **total** amount of content the model can see — splitting it across several attachments does not raise the budget). A cookie only takes the usable length from 130K to ~160K; genuinely long conversations still have to be compacted by the client
 - **Token counts**: tiktoken estimates (Gemini's real tokenizer is not public), within about ±20% of the true value
 - **Cookie pool never auto-removes a bad account**: outcomes are written back (only 401/403 count as the cookie's fault — network errors and 302 blocks don't), but failures never trigger an automatic disable, so you have to do it from the panel. Also `last_ok_at` only means "a request using this cookie succeeded", not that the cookie is still valid — an expired cookie doesn't error, Gemini just treats you as anonymous and plain text requests still return 200
 - **Streaming is only half real**: `/v1/responses` and chat requests carrying `tools` are buffered; only plain chat streams incrementally
@@ -450,7 +523,8 @@ docker-compose.yml         single container, pulls the ghcr image by default, sq
 | Panel diagnostics show **302 → `google.com/sorry/index`** | This exit IP is blocked by Google (after 80-180 requests, depending on connection strategy and exit quality) | Change exit / add proxies. **The block is hard, not probabilistic** (60 probes after a block, zero successes), so retrying in place is pointless |
 | Occasional empty responses, logged as an upstream refusal | Upstream transient refusal (`1155`). There is no predictable threshold — it correlates with neither rate, concurrency, nor cumulative count | Resend once and it usually works. **Lowering RPM does not help**: measured, it is unrelated to request rate |
 | Every request times out | This host can't reach `gemini.google.com` | Configure a proxy (panel or `--proxy`). Note that **`HTTPS_PROXY` is not read** |
-| `gemini-3.1-pro` errors out immediately | It isn't exposed without a cookie, by design | Attach a cookie (Settings page or Cookie pool) and it becomes available |
+| Exits at startup with `unable to open database file (14)` | The container runs as nonroot (uid 65532) but the bind-mounted host directory is owned by root, so it can't be written | Use a named volume (the default in compose), or `sudo chown -R 65532:65532 ./data` |
+| `gemini-3.1-pro` errors out immediately | It isn't exposed without a cookie, by design | Add an account on the Cookie pool page and it becomes available |
 | Every request returns 502 after attaching a cookie | The cookie expired, so the XSRF token can't be fetched | Re-export the cookie. Quick check: if `gemini-3.1-pro` reports 3.5 Flash-Lite, it's expired |
 | Panel won't open / 401 | `--admin-token` (or `ADMIN_TOKEN`) doesn't match | An empty token disables auth, which is only acceptable when bound to 127.0.0.1 |
 

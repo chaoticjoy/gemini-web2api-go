@@ -7,8 +7,7 @@ import (
 
 // 确认每个模型名解析出的 hex id 和 header 值正确。
 func TestModelHeader(t *testing.T) {
-	cookieRuntime.Store("SAPISID=dummy") // 让 3.1 Pro 可选，见 TestProHiddenWithoutCookie
-	defer cookieRuntime.Store("")
+	withPoolCookie(t) // 让 3.1 Pro 可选，见 TestProHiddenWithoutCookie
 
 	cases := []struct{ name, wantHex string }{
 		{"gemini-3.6-flash", hexFlash36},
@@ -48,8 +47,26 @@ func TestModelHeader(t *testing.T) {
 			t.Errorf("已移除的别名 %s 应该报错", gone)
 		}
 	}
-	if len(Models) != 3 {
-		t.Errorf("只应暴露 3 个真模型, got %d", len(Models))
+	// 守的是「不许冒出假模型」：thinking 版复用同样的 hex，所以看**去重后的 hex 数**，
+	// 不是条目数。服务端清单（otAQ7b）里就 3 个。
+	hexes := map[string]bool{}
+	for _, m := range Models {
+		hexes[m.HexID] = true
+	}
+	if len(hexes) != 3 {
+		t.Errorf("只应存在 3 个真模型 hex, got %d", len(hexes))
+	}
+	// 反过来：每个真 hex 都应该有一个 thinking 版
+	for _, base := range []string{hexFlash36, hexFlashLite, hexPro31} {
+		found := false
+		for _, m := range Models {
+			if m.HexID == base && m.Thinking {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("hex %s 缺 thinking 版", base)
+		}
 	}
 }
 
@@ -133,16 +150,16 @@ func TestToolChoice(t *testing.T) {
 	msgs := []map[string]interface{}{{"role": "user", "content": "hi"}}
 
 	// none：工具定义完全不进 prompt
-	if p := messagesToPrompt(msgs, tools, "none"); strings.Contains(p, "get_weather") {
+	if p := mustPrompt(t, msgs, tools, "none"); strings.Contains(p, "get_weather") {
 		t.Errorf("tool_choice=none 不该注入工具定义: %s", p)
 	}
 	// required：必须出现强制措辞
-	p := messagesToPrompt(msgs, tools, "required")
+	p := mustPrompt(t, msgs, tools, "required")
 	if !strings.Contains(p, "MUST call one of the tools") {
 		t.Errorf("tool_choice=required 缺强制指令: %s", p)
 	}
 	// 指定函数：只留该函数，且点名它
-	p = messagesToPrompt(msgs, tools, map[string]interface{}{"type": "function",
+	p = mustPrompt(t, msgs, tools, map[string]interface{}{"type": "function",
 		"function": map[string]interface{}{"name": "get_weather"}})
 	if !strings.Contains(p, `MUST call the tool "get_weather"`) {
 		t.Errorf("指定函数缺强制指令: %s", p)
@@ -151,7 +168,7 @@ func TestToolChoice(t *testing.T) {
 		t.Errorf("指定函数时不该带上其它工具: %s", p)
 	}
 	// auto：保持原来的宽松措辞
-	if p := messagesToPrompt(msgs, tools, "auto"); !strings.Contains(p, "when needed") {
+	if p := mustPrompt(t, msgs, tools, "auto"); !strings.Contains(p, "when needed") {
 		t.Errorf("auto 应保持宽松措辞: %s", p)
 	}
 }
@@ -231,9 +248,16 @@ func TestExtractUpstreamModel(t *testing.T) {
 // 让客户端在选型时就拿到明确错误，而不是拿到一个"成功但其实不是 Pro"的回复。
 // （配了有效 cookie 时它是真能用的，见 availableModels 注释。）
 func TestProHiddenWithoutCookie(t *testing.T) {
-	cookieRuntime.Store("")
+	// cookie 池此时是空的（TestMain 给的是全新临时库）
 	if _, ok := availableModels()["gemini-3.1-pro"]; ok {
 		t.Error("无 cookie 时不该暴露 3.1 Pro")
+	}
+	// inner[80]（扩展思考）只在登录态生效，匿名带上服务端静默忽略，
+	// 所以 thinking 版跟 3.1 Pro 一样不能暴露
+	for name, m := range availableModels() {
+		if m.Thinking {
+			t.Errorf("无 cookie 时不该暴露 thinking 版: %s", name)
+		}
 	}
 	if len(availableModels()) != 2 {
 		t.Errorf("无 cookie 时应只剩 2 个模型, got %d", len(availableModels()))
@@ -249,13 +273,18 @@ func TestProHiddenWithoutCookie(t *testing.T) {
 		t.Errorf("错误信息没解释原因和解法: %v", err)
 	}
 
-	cookieRuntime.Store("SAPISID=dummy")
-	defer cookieRuntime.Store("")
+	withPoolCookie(t)
 	if _, ok := availableModels()["gemini-3.1-pro"]; !ok {
 		t.Error("配了 cookie 时应暴露 3.1 Pro")
 	}
 	if _, _, err := resolveModel("gemini-3.1-pro"); err != nil {
 		t.Errorf("配了 cookie 时不该报错: %v", err)
+	}
+	for _, n := range []string{"gemini-3.6-flash-thinking", "gemini-3.5-flash-lite-thinking",
+		"gemini-3.1-pro-thinking"} {
+		if _, ok := availableModels()[n]; !ok {
+			t.Errorf("配了 cookie 时应暴露 %s", n)
+		}
 	}
 	// 真正不存在的模型仍然是 unknown model，不能被 cookie 提示盖掉
 	if _, _, err := resolveModel("no-such-model"); err == nil ||
@@ -284,4 +313,12 @@ func TestClassifyError(t *testing.T) {
 			t.Errorf("classifyError(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
+}
+
+// mustPrompt 是测试里的便捷包装：messagesToPrompt 现在会在 prompt 超长时返回错误。
+func mustPrompt(t *testing.T, msgs []map[string]interface{}, tools []map[string]interface{},
+	toolChoice interface{}) string {
+	t.Helper()
+	p, _ := messagesToPrompt(msgs, tools, toolChoice)
+	return p
 }

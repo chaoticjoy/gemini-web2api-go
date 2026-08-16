@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS requests (
     upstream_model  TEXT,
     proxy_id        INTEGER,
     proxy_name      TEXT,
+    account_id      INTEGER,
+    account_label   TEXT,
     status          INTEGER NOT NULL,
     error           TEXT,
     ttfb_ms         INTEGER,
@@ -108,7 +110,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_used_at  INTEGER NOT NULL DEFAULT 0,     -- 上次被挑中发请求的时刻
     last_ok_at    INTEGER NOT NULL DEFAULT 0,     -- 上次请求成功的时刻
     last_error    TEXT NOT NULL DEFAULT '',
-    fail_count    INTEGER NOT NULL DEFAULT 0      -- 连续失败次数（成功归零）
+    fail_count    INTEGER NOT NULL DEFAULT 0,     -- 连续失败次数（成功归零）
+    proxy_id      INTEGER NOT NULL DEFAULT 0      -- 绑定的出口，0 = 还没绑
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_pick ON accounts(status, last_used_at);
 `
@@ -119,8 +122,9 @@ func getDB() *sql.DB {
 		if path == "" {
 			path = "./data/gemini.db"
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "[db] mkdir failed: %v\n", err)
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "[db] 建目录 %s 失败: %v\n%s", dir, err, dbPermHint(dir))
 			os.Exit(1)
 		}
 		dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", path)
@@ -133,7 +137,10 @@ func getDB() *sql.DB {
 		conn.SetMaxIdleConns(4)
 		conn.SetConnMaxLifetime(0)
 		if _, err := conn.Exec(schema); err != nil {
-			fmt.Fprintf(os.Stderr, "[db] schema init failed: %v\n", err)
+			// 这里最常见的是 SQLITE_CANTOPEN(14)：目录存在但当前用户写不进去。
+			// 光报 "unable to open database file (14)" 没人猜得到是权限，所以把
+			// 判据和解法一起打出来。
+			fmt.Fprintf(os.Stderr, "[db] 初始化 %s 失败: %v\n%s", path, err, dbPermHint(dir))
 			os.Exit(1)
 		}
 		// Migration: drop legacy prompt_preview / response_preview columns
@@ -141,6 +148,11 @@ func getDB() *sql.DB {
 		// Errors are ignored — columns may already be absent.
 		// 老库补上服务端自报的模型名列（列已存在时报错，忽略）
 		_, _ = conn.Exec(`ALTER TABLE requests ADD COLUMN upstream_model TEXT`)
+		// 老库补上 cookie 归属列（列已存在时报错，忽略）
+		_, _ = conn.Exec(`ALTER TABLE requests ADD COLUMN account_id INTEGER`)
+		_, _ = conn.Exec(`ALTER TABLE requests ADD COLUMN account_label TEXT`)
+		// 老库补上账号↔出口绑定列
+		_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN proxy_id INTEGER NOT NULL DEFAULT 0`)
 		_, _ = conn.Exec(`ALTER TABLE requests DROP COLUMN prompt_preview`)
 		_, _ = conn.Exec(`ALTER TABLE requests DROP COLUMN response_preview`)
 		db = conn
@@ -158,6 +170,8 @@ type RequestRow struct {
 	UpstreamModel string `json:"upstream_model"`
 	ProxyID       *int64 `json:"proxy_id"`
 	ProxyName     string `json:"proxy_name"`
+	AccountID     *int64 `json:"account_id"`
+	AccountLabel  string `json:"account_label"`
 	Status        int    `json:"status"`
 	Error         string `json:"error"`
 	TTFBMs        *int64 `json:"ttfb_ms"`
@@ -172,11 +186,13 @@ type RequestRow struct {
 
 func insertRequest(r *RequestRow) {
 	_, err := getDB().Exec(`INSERT INTO requests
-        (ts, model, upstream_model, proxy_id, proxy_name, status, error, ttfb_ms, total_ms,
+        (ts, model, upstream_model, proxy_id, proxy_name, account_id, account_label,
+         status, error, ttfb_ms, total_ms,
          prompt_chars, response_chars, prompt_tokens, output_tokens,
          endpoint, stream)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.TS, r.Model, r.UpstreamModel, r.ProxyID, r.ProxyName, r.Status, r.Error, r.TTFBMs, r.TotalMs,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.TS, r.Model, r.UpstreamModel, r.ProxyID, r.ProxyName, r.AccountID, r.AccountLabel,
+		r.Status, r.Error, r.TTFBMs, r.TotalMs,
 		r.PromptChars, r.ResponseChars, r.PromptTokens, r.OutputTokens,
 		r.Endpoint, r.Stream)
 	if err != nil {
@@ -220,4 +236,21 @@ func kvGet(k string) string {
 func kvSet(k, v string) error {
 	_, err := getDB().Exec(`INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k, v)
 	return err
+}
+
+// dbPermHint 在数据库打不开时给出可操作的提示。
+//
+// 判据：容器镜像是 distroless + USER nonroot（uid 65532），而 bind mount 会用宿主
+// 目录的属主整个盖掉镜像里 /data 的属主。宿主上目录不存在时 Docker 自动建、属主是
+// root，于是容器里的 65532 写不进去 —— 实测这就是 `unable to open database file (14)`
+// 的成因（同一条命令只把属主 chown 成 65532 就能起来）。
+func dbPermHint(dir string) string {
+	uid := os.Getuid() // Windows 上返回 -1，那边不涉及这个问题
+	return fmt.Sprintf(""+
+		"      当前进程 uid=%d，写不进目录 %s。\n"+
+		"      Docker 部署最常见的原因是 bind mount 的宿主目录属主是 root，\n"+
+		"      而镜像以 nonroot(65532) 运行。两种解法：\n"+
+		"        1) 改用具名卷（推荐）：volumes 写 gw2a-data:/data\n"+
+		"        2) 保留 bind mount 就把属主改过来：sudo chown -R 65532:65532 ./data\n",
+		uid, dir)
 }

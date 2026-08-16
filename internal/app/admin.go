@@ -280,6 +280,7 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 
 	q := `SELECT id, ts, model, IFNULL(upstream_model,''), IFNULL(proxy_id,0), IFNULL(proxy_name,''),
+        IFNULL(account_id,0), IFNULL(account_label,''),
         status, IFNULL(error,''), IFNULL(ttfb_ms,0), total_ms,
         prompt_chars, response_chars, prompt_tokens, output_tokens,
         IFNULL(endpoint,''), stream FROM requests WHERE 1=1`
@@ -305,10 +306,11 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 
 	var list []map[string]interface{}
 	for rows.Next() {
-		var id, ts, proxyID, ttfb, totalMs int64
-		var model, upstreamModel, proxyName, errStr, endpoint string
+		var id, ts, proxyID, acctID, ttfb, totalMs int64
+		var model, upstreamModel, proxyName, acctLabel, errStr, endpoint string
 		var status, promptC, respC, promptT, outT, stream int
 		if err := rows.Scan(&id, &ts, &model, &upstreamModel, &proxyID, &proxyName,
+			&acctID, &acctLabel,
 			&status, &errStr, &ttfb, &totalMs,
 			&promptC, &respC, &promptT, &outT,
 			&endpoint, &stream); err != nil {
@@ -321,6 +323,8 @@ func handleAdminRequests(w http.ResponseWriter, r *http.Request) {
 			"upstream_model": upstreamModel,
 			"proxy_id":       proxyID,
 			"proxy_name":     proxyName,
+			"account_id":     acctID,
+			"account_label":  acctLabel,
 			"status":         status,
 			"error":          errStr,
 			"ttfb_ms":        ttfb,
@@ -718,60 +722,6 @@ func modelNamesSorted() []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-// handleAdminCookie 读写 Google 账号 cookie。
-// GET 只返回状态摘要，**不回显完整值**——凭证没有必要再从服务端发回浏览器一次。
-func handleAdminCookie(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		raw := currentCookieRaw()
-		names := []string{}
-		for _, p := range strings.Split(raw, "; ") {
-			if i := strings.Index(p, "="); i > 0 {
-				names = append(names, p[:i])
-			}
-		}
-		key := []string{}
-		for _, want := range []string{"SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSID"} {
-			for _, n := range names {
-				if n == want {
-					key = append(key, want)
-					break
-				}
-			}
-		}
-		writeJSON(w, 200, map[string]interface{}{
-			"configured":   raw != "",
-			"length":       len(raw),
-			"cookie_count": len(names),
-			"key_cookies":  key,
-			"from_file":    raw != "" && kvGet("google_cookie") == "",
-			"file_path":    cfg.CookieFile,
-		})
-	case http.MethodPut:
-		var body struct {
-			Cookie string `json:"cookie"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(w, 400, map[string]string{"error": "invalid JSON: " + err.Error()})
-			return
-		}
-		raw := strings.TrimSpace(body.Cookie)
-		if raw != "" && !strings.Contains(raw, "SAPISID") {
-			writeJSON(w, 400, map[string]string{
-				"error": "cookie 里没有 SAPISID，多半没复制全。需要 gemini.google.com 下的完整 cookie（至少含 SID / HSID / SSID / APISID / SAPISID / __Secure-1PSID）"})
-			return
-		}
-		if err := setCookie(raw); err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		logf("[cookie] 已%s（面板）", map[bool]string{true: "保存", false: "清除"}[raw != ""])
-		writeJSON(w, 200, map[string]interface{}{"ok": true, "configured": raw != ""})
-	default:
-		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
-	}
 }
 
 // classifyError 把 requests.error 归到几个可行动的类别。

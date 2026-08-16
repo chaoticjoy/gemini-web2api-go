@@ -40,7 +40,30 @@ type ToolCallFunction struct {
 // {"type":"function","function":{"name":...}}）。上游没有协议层的工具调用，
 // 只能把约束写进指令。"required" 尤其必要：实测 Gemini 对自己能回答的问题
 // （查天气之类）会直接作答而不调工具，不强制就拿不到 tool_call。
+// 返回 (拼好的 prompt, 最新那条用户消息)。
+//
+// 超长检查不在这里做 —— 挂了 cookie 时超长会转成文本附件，而那要等挑完账号和
+// 出口才知道能不能做，所以判断放在 streamGenerate 里。最新那条消息单独返回，
+// 转附件时用来内联，好让模型不必去文件里找问题。
 func messagesToPrompt(messages []map[string]interface{}, tools []map[string]interface{},
+	toolChoice interface{}) (string, string) {
+	return buildPrompt(messages, tools, toolChoice), latestUserMessage(messages)
+}
+
+// latestUserMessage 取最后一条 user 消息的正文，没有则返回空串。
+func latestUserMessage(messages []map[string]interface{}) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		role := getStr(messages[i], "role")
+		if role == "user" || role == "" {
+			if c := strings.TrimSpace(contentToString(messages[i]["content"])); c != "" {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+func buildPrompt(messages []map[string]interface{}, tools []map[string]interface{},
 	toolChoice interface{}) string {
 	var parts []string
 
@@ -168,6 +191,94 @@ func getStr(m map[string]interface{}, k string) string {
 	return ""
 }
 
+const (
+	toolFenceOpen  = "```tool_call"
+	toolFenceClose = "```"
+)
+
+// toolFenceGate 让带 tools 的请求也能真流式。
+//
+// 问题：上游没有协议层的工具调用，我们让模型吐 ```tool_call``` 围栏，而围栏要
+// 完整文本才能解析。边出边转发会把围栏原文推给客户端 —— 客户端看到的是一段
+// markdown 代码块，不是 tool_calls。所以这条路以前退化成收完再发。
+//
+// 解法：只发**确定不属于围栏**的部分。围栏内的全部扣住，最后由 parseToolCalls
+// 统一转成 tool_calls。关键是尾巴上可能压着半个开围栏（比如只到两个反引号，
+// 或者到 tool_c 就断了），那部分也得扣住等下一帧 —— 否则先发出去，下一帧才发现
+// 它是围栏的开头，而已发出的内容收不回来。
+//
+// Sent() 是**实际发给客户端**的文本，跟 deltaTracker 的 emitted 不是一回事
+// （后者含围栏原文）。收尾补发尾巴时必须拿这个比，否则前缀对不上，尾巴会丢。
+type toolFenceGate struct {
+	emit    func(string)
+	buf     string // 还没判定完的尾巴
+	sent    strings.Builder
+	inFence bool
+}
+
+func newToolFenceGate(emit func(string)) *toolFenceGate {
+	return &toolFenceGate{emit: emit}
+}
+
+// Sent 返回到目前为止实际发给客户端的全部文本。
+func (g *toolFenceGate) Sent() string {
+	if g == nil {
+		return ""
+	}
+	return g.sent.String()
+}
+
+func (g *toolFenceGate) send(s string) {
+	if s == "" {
+		return
+	}
+	g.sent.WriteString(s)
+	g.emit(s)
+}
+
+// Push 吃进一段增量文本，把确定不在围栏里的部分立刻发出去。
+func (g *toolFenceGate) Push(delta string) {
+	g.buf += delta
+	for {
+		if g.inFence {
+			j := strings.Index(g.buf, toolFenceClose)
+			if j < 0 {
+				return // 围栏还没闭合，整段扣住
+			}
+			g.buf = g.buf[j+len(toolFenceClose):]
+			g.inFence = false
+			continue
+		}
+		if i := strings.Index(g.buf, toolFenceOpen); i >= 0 {
+			g.send(g.buf[:i])
+			g.buf = g.buf[i+len(toolFenceOpen):]
+			g.inFence = true
+			continue
+		}
+		keep := partialPrefixLen(g.buf, toolFenceOpen)
+		g.send(g.buf[:len(g.buf)-keep])
+		g.buf = g.buf[len(g.buf)-keep:]
+		return
+	}
+}
+
+// partialPrefixLen 返回 s 的末尾有多少字节是 marker 的前缀（不含完整匹配）。
+//
+// marker 全是 ASCII，所以匹配到的后缀必然也全是 ASCII，切点不会落在多字节
+// 字符中间 —— UTF-8 的续字节 >=0x80，永远不等于 marker 里的任何字节。
+func partialPrefixLen(s, marker string) int {
+	max := len(marker) - 1
+	if len(s) < max {
+		max = len(s)
+	}
+	for k := max; k > 0; k-- {
+		if strings.HasPrefix(marker, s[len(s)-k:]) {
+			return k
+		}
+	}
+	return 0
+}
+
 var toolCallRe = regexp.MustCompile("(?s)```tool_call\\s*\\n(.*?)\\n```")
 
 // parseToolCalls extracts ```tool_call``` blocks. Returns clean text + tool_calls.
@@ -217,4 +328,49 @@ func parseToolChoice(tc interface{}) (string, string) {
 		}
 	}
 	return "auto", ""
+}
+
+// PromptTooLongError 表示 prompt 超过了单次请求能塞的上限。
+//
+// 为什么是报错而不是我们自己截：上游超限时**从尾部静默截断**且不报错，而最新
+// 消息拼在末尾，所以被吃掉的正好是用户刚问的那句 —— 模型只看到前面的系统前言，
+// 回一句通用开场白，既不答题也不调工具。
+//
+// 也不自己丢历史：那仍然是静默丢数据，只是换了个地方丢。客户端以为整段都发出去
+// 了，模型却忘了东西，答案微妙地错而没人知道。报 context_length_exceeded 是
+// OpenAI 兼容客户端认得的信号，agentic 客户端收到会自己压缩上下文再试 ——
+// 它比我们盲丢最旧的几段聪明得多。
+//
+// **为什么按字节而不是按 token 判**：静态 IP 上把中英文对齐到同一字节数实测，
+// 两者的墙落在完全相同的位置 —— 约 129,950 字节各 3/3 通过、135,990 字节各 1/3、
+// 141,920 字节各 1/3；而同一批请求的 tiktoken 计数差了 1.9 倍（英文 24,273 对
+// 中文 46,591）。按 token 设阈值的话，同一个数字对英文太松、对中文卡在真实容量的
+// 三分之一左右。
+//
+// 顺带排除了"墙在传输层"：prompt 进 f.req 要先 JSON 再 urlencode，中文每个字节
+// 变成 %XX（3 倍膨胀）、英文基本原样，两者的线上体积差近 3 倍却撞同一堵墙，
+// 所以计的是 prompt 内容的字节数，不是请求体大小。
+//
+// 真要撑住长上下文得走另一条路：把内容转成文件附件。但那需要登录态（匿名能上传、
+// 对话里引用会被服务端回 1100 拒绝），所以现在只能报错。
+type PromptTooLongError struct {
+	Bytes, Budget int
+	HasCookie     bool // 有 cookie 却还超，说明附件那条路也没救回来
+}
+
+func (e *PromptTooLongError) Error() string {
+	base := fmt.Sprintf(
+		"prompt is %d bytes, over the %d-byte per-request limit of the Gemini web "+
+			"protocol (the limit is on UTF-8 bytes, not tokens). The upstream silently "+
+			"truncates from the end, which would drop your latest message and produce an "+
+			"unrelated answer, so this request is rejected instead.",
+		e.Bytes, e.Budget)
+	if !e.HasCookie {
+		// 没 cookie 时这不是死路：导一个进来就能走附件，长度限制基本就没了。
+		// 不说这句的话用户只会以为"这项目撑不住长上下文"。
+		return base + " Add a Google account cookie in the admin panel (Cookie pool) — " +
+			"with one configured, oversized conversations are uploaded as a text " +
+			"attachment instead and this limit largely goes away."
+	}
+	return base + " Shorten the conversation, the system prompt, or the tool definitions."
 }

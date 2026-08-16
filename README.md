@@ -36,13 +36,14 @@
 **模型**
 - `gemini-3.6-flash`、`gemini-3.5-flash-lite` 匿名可用，含联网搜索
 - `gemini-3.1-pro` 挂 cookie 后可用，每次回答带思考链（`reasoning_content`）
+- 三个模型都有 `-thinking` 版（扩展思考），挂 cookie 后可用
 - 响应里记录服务端**实际**用了哪个模型，被静默降级一眼可见
 
 **不被拦 / 跑得久**
 - utls 模拟 Chrome 146 真 TLS 指纹，不是 SDK 默认握手
 - 每个出口 IP 独立限流：并发 / RPM / RPH 三档
 - 代理池：运行时增删改、失败熔断、轮转调度，每个代理是独立限流槽
-- Cookie 池：多个 Google 账号按最久未用优先轮转
+- Cookie 池：多个 Google 账号按最久未用优先轮转，自动续期 + 保活，每个账号粘住自己的出口
 
 **运维**
 - 单二进制，交叉编译 6 平台；容器镜像基于 distroless
@@ -170,6 +171,35 @@ OpenAI 形状的接口，没做 `/v1beta`。
 
 另有一个不鉴权的健康检查 `GET /`，返回 `{"status":"ok","version":…,"models":[…]}`，给探活用。
 
+## MCP（web_search 工具）
+
+除了 OpenAI 接口，同一个进程、同一个端口还挂了一个 **MCP server**，在 `/mcp` 上，
+把 Gemini 网页端的**联网搜索**暴露成一个 `web_search` 工具。让 Claude Desktop /
+Claude Code / Cursor 这类 MCP 客户端能「用 Gemini 去搜网」，返回**合成答案 + 来源链接**。
+
+不用单独起进程、不用额外部署——起了后端就有。传输是 HTTP（Streamable HTTP），
+所以远程客户端连 URL 就能用，复用后端的账号池 / 代理池 / 限流。匿名即可搜，不必挂 cookie。
+
+**客户端配置**（以 Claude Desktop 的 `claude_desktop_config.json` 为例）：
+
+```json
+{
+  "mcpServers": {
+    "gemini-search": {
+      "url": "http://你的服务器:8083/mcp",
+      "headers": { "Authorization": "Bearer sk-gemini-你的key" }
+    }
+  }
+}
+```
+
+- `url` 指向后端的 `/mcp`；本机跑就是 `http://localhost:8083/mcp`。
+- `Authorization` 填 OpenAI 接口那把同样的 API key（面板「设置」页里看）。
+- Claude Code：`claude mcp add --transport http gemini-search http://localhost:8083/mcp --header "Authorization: Bearer sk-gemini-你的key"`。
+
+工具 `web_search(query)`：传一个查询/问题，返回 Gemini 联网查证后的答案，末尾附
+`Sources:` 来源清单。当前只有这一个工具（读取指定 URL 的 `url_context` 暂未做）。
+
 ## 管理面板
 
 `http://localhost:8083/admin`，用 `--admin-token` 登录。
@@ -177,10 +207,15 @@ OpenAI 形状的接口，没做 `/v1beta`。
 - **概览** — 24h KPI + 请求量/P50 延迟双轴趋势图 + 模型/代理分组统计 + IP 限流用量 + 一键连通性诊断
 - **请求记录** — 明细列表（仅元数据，无 prompt/response 内容），状态/模型筛选 + 分页
 - **代理池** — 运行时增删改 + 启用/禁用 + 失败次数熔断（每代理是独立 IP slot）
-- **Cookie 池** — 导入多个 Google 登录态账号，请求按**最久未用优先**自动轮转，池空才回落「设置」页那一个 cookie。列表只显示脱敏摘要（cookie 数 / 关键项 / SAPISID 末 4 位 / 失败次数）
-- **设置** — 运行时配置表单（保存即生效）+ API Key 轮换 + Cookie 粘贴 + 部署期配置只读展示
+- **Cookie 池** — 导入多个 Google 登录态账号，请求按**最久未用优先**自动轮转。每个账号一键「检测」是否仍是登录态；自动续期 + 每 10 分钟保活；每个账号粘住自己的出口。列表只显示脱敏摘要（cookie 数 / 关键项 / SAPISID 末 4 位 / 失败次数）
+- **设置** — 运行时配置表单（保存即生效）+ API Key 轮换 + 部署期配置只读展示
 
 面板前端是单个 HTML，Chart.js 随二进制 embed，**不走 CDN**——内网/离线部署也能开。
+
+**反代到子路径不用额外配置**：面板里的地址全是相对的，把 `https://example.com/gemini/`
+转发到本服务的 `/` 就能用 `https://example.com/gemini/admin` 打开。（访问不带尾斜杠的
+`/admin` 会 301 到 `admin/`——相对地址按文档 URL 的目录解析，两种形式差一层，统一一下
+才不会解析错。）
 
 ## 模型
 
@@ -191,6 +226,11 @@ Gemini 网页端服务端只认三个模型（清单来自 `batchexecute?rpcids=
 | `gemini-3.6-flash` | 全方位，默认 |
 | `gemini-3.5-flash-lite` | 极速、轻量 |
 | `gemini-3.1-pro` | 最强，**要配 cookie**；每次回答都带思考链 |
+| `gemini-3.6-flash-thinking` | 3.6 Flash 开扩展思考，**要配 cookie** |
+| `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite 开扩展思考，**要配 cookie** |
+| `gemini-3.1-pro-thinking` | 3.1 Pro 开扩展思考，**要配 cookie** |
+| `gemini-image` | 生图（Nano Banana），产物 base64，**要配 cookie** |
+| `gemini-music` | 音乐（Lyria，约 30 秒），产物 base64，**要配 cookie** |
 
 没配 cookie 时 `/v1/models` 只返回前两个，选 `gemini-3.1-pro` 会直接报错并说明
 原因。因为匿名请求它必然被静默降级成 3.5 Flash-Lite——与其让客户端拿到一个
@@ -198,7 +238,12 @@ Gemini 网页端服务端只认三个模型（清单来自 `batchexecute?rpcids=
 
 配了有效 cookie 时它是**真的 Pro**：连打 6 次服务端回报的都是 `3.1 Pro` 本身。
 
-只暴露这三个。旧的 `gemini-3.5-flash`、`gemini-3.5-flash-thinking`、
+三个 `-thinking` 是网页 UI 上「扩展思考」的开关，跟模型正交——三个模型都能开，
+不是三个额外的模型。服务端回报的名字会带 `Extended`（如 `3.6 Flash Extended`），
+思考链明显变长（实测 2467 / 1059 / 583 字符，对应普通版 0 / 0 / 268）。
+**只在登录态生效**：匿名请求带上这个开关会被服务端静默忽略，所以没 cookie 时不暴露。
+
+只暴露这三个基础模型。旧的 `gemini-3.5-flash`、`gemini-3.5-flash-thinking`、
 `gemini-3.5-flash-thinking-lite`、`gemini-auto`、`gemini-flash-lite` **已移除**
 （传了会返回 400）——它们在服务端没有对应条目，留着只会让人以为有五种不同
 的模型可选。
@@ -239,21 +284,43 @@ I've successfully defined..."
 匿名调用（不挂 cookie）只能拿到上面两个文本模型 + Gemini 自带的联网搜索。
 `gemini-3.1-pro` 匿名时被静默降级成 3.5 Flash-Lite，所以干脆不暴露。
 
-生图、音乐、视频、深度研究、画布都需要登录，且**本项目尚未实现**——它们要在请求里
-多带工具开关位，而我们的参数数组还没开那么长。管理面板的「实际模型」列会把服务端
-实际用了哪个模型标出来，降级一眼可见。
+挂上 cookie 额外解锁：`gemini-3.1-pro`、**三个模型的扩展思考版**、**读图**、**更长的上下文**
+（超长对话自动转成文本附件发，见下文），以及 **生图（`gemini-image`）** 和
+**音乐（`gemini-music`）**（见下面「生图 / 音乐」一节）。
 
-**多轮上下文是靠把 `messages` 拼成单个 prompt 实现的，不是协议级多轮。**
+视频、深度研究、画布也需要登录，但**本项目尚未实现**：视频免费号被上游拒，深度研究是
+多步异步流程，都不是加一行能搞定的。管理面板的「实际模型」列会把服务端实际用了哪个
+模型标出来，降级一眼可见。
 
-Gemini 网页端本身支持协议级多轮（浏览器发第二句时只传新消息 + 会话 id，历史
-由服务端保存），匿名会话也支持。但复现不了：按浏览器的确切格式传
-`inner[2] = [cid, 上轮rid, "", …, token]`、`inner[17] = [[轮次]]`、URL 带
-`f.sid`，全部对齐后服务端仍然拒绝。唯一没能复现的是 `inner[3]` 的 botguard
-token——抓包里三轮分别是 1404 / 1847 / 2489 字节，由浏览器 JS 运行时生成，
-纯 HTTP 客户端造不出来。
+### 生图 / 音乐
 
-所以拼 prompt 是目前唯一可行的方式。代价是每轮重发全部历史，且受单次输入
-长度上限约束。
+`gemini-image`（Nano Banana）和 `gemini-music`（Lyria，约 30 秒）跟普通对话一样走
+`/v1/chat/completions`，user 消息里写要画什么 / 要什么曲子。产物字节以 **base64
+data URL** 放进返回的 `content`：图片是 `![image](data:image/png;base64,…)`、音频是
+`[audio](data:audio/mpeg;base64,…)`。支持 markdown 的客户端能直接把图渲染出来；要存
+文件就 decode 逗号后面那段 base64。
+
+```bash
+curl http://127.0.0.1:8083/v1/chat/completions \
+  -H "Authorization: Bearer sk-gemini-..." -H "Content-Type: application/json" \
+  -d '{"model":"gemini-image","messages":[{"role":"user","content":"画一只戴宇航员头盔的橘猫"}]}'
+```
+
+不转外链是有意的——Gemini 的产物链要带 cookie 才下得到，直接把链给客户端它打不开，
+所以服务端下回字节再转 base64。产物的 base64 **不计进 `completion_tokens`**（否则一张图
+上百万 token，下游按它计费就离谱了），只算模型附带的说明文字。都要登录态，没 cookie
+时这俩模型不进 `/v1/models`。参数如 `size` / `n` 上游没有对应旋钮，传了会被忽略。
+
+**多轮上下文是靠把 `messages` 拼成单个 prompt 实现的**（网页协议的原生多轮要一个
+浏览器 JS 运行时才能生成的令牌，纯 HTTP 造不出来）。代价是每轮重发全部历史，于是撞上
+单次输入的长度墙：**约 13 万 UTF-8 字节**，超了上游**从尾部静默截断且不报错**——而最新
+消息拼在末尾，被吃掉的正是你刚问的那句，表现像"模型突然变笨"。
+
+挂 cookie 时超长对话会自动转成 `message.txt` 附件发上去，绕开请求体那堵墙；**但附件
+另有一堵墙**：模型能看到的内容合计约 **16 万字节**，超出部分传上去了也读不到（实测总量
+固定、只挪暗号偏移：157,833 处读得到、163,371 处读不到；切成多份附件不涨额度）。
+所以挂 cookie 把可用长度从 13 万提到约 16 万，**真正的长对话仍需客户端自己压缩**。
+没挂 cookie 时直接返回 400 `context_length_exceeded`，不静默丢数据。
 
 ## 配置
 
@@ -267,11 +334,11 @@ token——抓包里三轮分别是 1404 / 1847 / 2489 字节，由浏览器 JS 
 |---|---|
 | 默认模型 | 客户端没传 `model` 时用哪个 |
 | 每 slot 并发 / RPM / RPH | 限流额度，0 = 不限 |
+| Prompt 字节上限 | 超了：挂 cookie 时转成文本附件发（可用长度到约 16 万字节），没挂时返回 400 `context_length_exceeded`。都不静默截断。按 UTF-8 字节算（上游的墙跟 token 无关），默认 128000。0 = 不限 |
 | 重试次数 / 重试间隔 / 上游超时 | |
 | 明细保留天数 | 过期只删明细，聚合数据永久保留 |
 | TLS 指纹 | `chrome_146`（默认）/ `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
 | Gemini `bl` 版本 | 上游前端版本号，过期时改这里 |
-| 静态代理 | 代理池为空时的兜底；一般用「代理池」页面配 |
 | 打印请求日志 | |
 
 所有值都在后端做范围校验（比如 `retry_attempts` 只接受 1-10、超时 5-600 秒），
@@ -296,9 +363,10 @@ token——抓包里三轮分别是 1404 / 1847 / 2489 字节，由浏览器 JS 
 | 数据库路径 | `volumes` + `command: --db` |
 | `ADMIN_TOKEN` | `environment`，面板登录 token |
 
-另有两个**可选的锁定开关**，用于不希望运行时被改的部署：`API_KEY` 环境变量会
-锁死 API key（面板改不了）、`--cookie-file` 指向的文件在面板没存 cookie 时作为
-兜底。不设的话默认路径都是面板。
+`API_KEY` 环境变量会锁死 API key（面板改不了），用于不希望运行时被改的部署。
+
+`--proxy` 和 `--cookie-file` 是**播种参数**，不是第二套配置：启动时把值导入代理池 /
+Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。改了重启即生效。
 
 命令行参数仍然可用，定位是本地调试时的临时覆盖。优先级：
 **面板改动 > CLI flag / `config.json` > 内置默认**。
@@ -317,18 +385,18 @@ token——抓包里三轮分别是 1404 / 1847 / 2489 字节，由浏览器 JS 
 | `--db` | SQLite 路径，默认 `./data/gemini.db` |
 | `--admin-token` | 面板登录 token，留空 = 面板不鉴权（只有绑 127.0.0.1 才可接受） |
 | `--api-key` | 锁定 `/v1/*` 的 key（面板改不了），等价于 `API_KEY` 环境变量 |
-| `--cookie-file` | 面板没存 cookie 时的兜底文件 |
-| `--proxy` | 代理池为空时的静态代理 |
+| `--cookie-file` | 启动时把文件里的 cookie 导入 Cookie 池 |
+| `--proxy` | 启动时把这个代理导入代理池 |
 | `--impersonate` | TLS 指纹档位 |
 | `--version` | 打印版本退出（Docker healthcheck 用的就是它） |
 
 ## Cookie（可选）
 
 挂 Google 账号 cookie 后请求走登录态，多出来的能力是 **`gemini-3.1-pro` + 思考链**
-（见上文「思考链」一节）。免费账号实测可用，连打 6 次全部回报 `3.1 Pro`。
+（见上文「思考链」一节）、**读图**、**生图（`gemini-image`）/ 音乐（`gemini-music`）**
+（见上文「生图 / 音乐」一节）。免费账号实测可用，连打 6 次全部回报 `3.1 Pro`。
 
-网页端登录后还能用生图（Nano Banana 2）、音乐（Lyria 3）、视频、深度研究、画布，
-**本项目尚未实现这些**。
+网页端登录后还能用视频、深度研究、画布，**本项目尚未实现这几个**。
 
 > 带 cookie 的请求必须额外携带一个 XSRF token，本项目会自动从 Gemini 页面取并按
 > cookie 缓存、过期自动重取，无需配置。（这一步缺了会导致**所有**请求 400，
@@ -337,8 +405,8 @@ token——抓包里三轮分别是 1404 / 1847 / 2489 字节，由浏览器 JS 
 1. 浏览器登录 [gemini.google.com](https://gemini.google.com)
 2. DevTools (F12) → Application → Cookies → `https://gemini.google.com`
 3. 复制：`SID` / `HSID` / `SSID` / `APISID` / `SAPISID` / `__Secure-1PSID`
-4. 粘进面板「设置 → Google Cookie」，保存即生效；或写成 `cookie.txt` 后启动加
-   `--cookie-file cookie.txt`（面板里存了就以面板为准）：
+4. 粘进面板「Cookie 池 → 添加账号」；或写成 `cookie.txt` 后启动加
+   `--cookie-file cookie.txt`（启动时导入池子，之后从面板管理）：
 ```
 SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...
 ```
@@ -346,45 +414,65 @@ SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...
 JSON 形式 `{"cookie": "SID=...; ...", "sapisid": "..."}` 也吃。带 `SAPISID` 的请求会自动
 算 `SAPISIDHASH` 授权头，所以这一项不能少。
 
-**多个账号用「Cookie 池」页**：每个请求按最久未用优先挑一个 enabled 账号，挑中即推进轮转，
-池空才回落到上面这个单 cookie。挂了任一路径 `gemini-3.1-pro` 就会出现在模型列表里。
+**cookie 只有「Cookie 池」这一个入口**：每个请求按最久未用优先挑一个 enabled 账号，
+挑中即推进轮转。池子里有 enabled 账号，`gemini-3.1-pro` 就会出现在模型列表里。
 
 账号的「失败次数 / 最近成功」会随请求自动更新。判据是**只把 401/403 算作 cookie 的错**：
 网络错误、代理失败、被 Google 拦（302）一律不计——住宅代理的出口退化率很高，把这些算
 进去会让失败次数变成代理噪音，好 cookie 反而被记成失败最多的那个。
 
 注意「最近成功」只说明这个 cookie 参与的请求成功过，**不等于 cookie 仍然有效**：cookie
-过期后 Gemini 不报错，只是把你当匿名用户。想确认有效性就发一次 `gemini-3.1-pro`——有效
-时回报 `3.1 Pro` 并带思考链，失效时降级成 3.5 Flash-Lite。
+过期后 Gemini 不报错，只是把你当匿名用户。要确认有效性点列表里的「检测」按钮，它区分
+"登录态有效"和"过期/无效"，不用发一次真实对话去试。
+
+**cookie 会自动续期，不用你操心**。上游几乎每个响应都会刷新 `SIDCC` / `__Secure-1PSIDCC` /
+`__Secure-3PSIDCC`，我们收下并写回账号；另外每 10 分钟往 `accounts.google.com/RotateCookies`
+打一次保活（间隔由服务端指定，那个响应刷的也是同一组三项）。
+
+**每个账号会粘住自己的出口**。cookie 池和代理池如果各自独立轮转，同一个 Google 账号会
+从几十个不同 IP 发出请求，这在 Google 眼里是账号共享的典型特征。账号首次用到哪个出口就
+绑定下来，出口不可用了才换。
+
+**一个号挂了会自动换下一个**，不让整个请求陪葬——否则池子越大越容易踩雷。
 
 ## 代理池（白嫖路线核心）
 
-**为什么需要**：单 IP 打到一定次数就会被重定向到 `google.com/sorry/index`。这个
-次数是 **80-180**，跨度很大，**主要由连接策略和出口质量决定，不由请求节奏决定**：
+**为什么需要**：单 IP 突发地打到一定次数就会被重定向到 `google.com/sorry/index`。
+这个次数是 **80-180**，跨度很大，由**连接策略、出口质量和请求节奏**共同决定：
 
-| 连接策略 | 并发 | 节奏 | 被拦时的成功次数 |
-|---|---|---|---|
-| 复用连接池 | 10 | 无间隔 | 151 / 172 / 177 |
-| 复用连接池 | 3 | 无间隔 | 103 / 111 |
-| 每次新建连接 | 10 | 无间隔 | 106 / 109 |
-| 每次新建连接 | 1 | 间隔 24s | 81 / 166 |
+| 出口 | 连接策略 | 并发 | 节奏 | 被拦时的成功次数 |
+|---|---|---|---|---|
+| 住宅 | 复用连接池 | 10 | 无间隔 | 151 / 172 / 177 |
+| 住宅 | 复用连接池 | 3 | 无间隔 | 103 / 111 |
+| 住宅 | 每次新建连接 | 10 | 无间隔 | 106 / 109 |
+| 住宅 | 每次新建连接 | 1 | 间隔 24s | 81 / 166 |
+| 静态 | 复用连接池 | 10 | 无间隔 | 188 |
+| 静态 | 复用连接池 | 1 | **10 次/分钟** | **800 次没被拦** |
 
-判据只认 302 → `/sorry/`，出口都预筛过。唯一变量干净的对照是连接策略：并发钉死 10、
-两臂同时起跑、全程只跑 80 秒（短到出口来不及漂移），复用连接 172/177，每次新建
-106/109——**保持长连接能让单出口多打约 60%**。
+判据只认 302 → `/sorry/`，出口都预筛过。
 
-**放慢节奏没用。** 突发档 103-177、慢速档 81-166，两个区间几乎完全重叠，慢速档两个
-样本自己就差一倍。原因是长时间跑的出口在漂移，不是节奏起了作用。
+**连接复用值约 60%**：并发钉死 10、两臂同时起跑、全程只跑 80 秒（短到出口来不及
+漂移），复用连接 172/177，每次新建 106/109。
+
+**平缓节奏比什么都管用**：同一个静态 IP，突发打在 188 次被拦，改成 10 次/分钟连打
+**800 次、跨 110 分钟一次没被拦**。所以默认 `per_ip_rph=80` 是很保守的下沿，
+明确按低速率跑的部署可以调高很多。
+
+> 早前这里写「放慢节奏没用」，判据是住宅出口上突发档 103-177 与慢速档 81-166 几乎
+> 完全重叠。那个观察没错，但归因错了：住宅出口跑久了自己会退化（8 个预筛干净的
+> 出口跑慢节奏，6 个中途失败率超 40%），退化盖过了节奏的影响。换静态 IP 排除掉
+> 这个混淆项之后，节奏的作用非常明显。
 
 **代理失败会提前消耗额度**：链路越脏上限来得越早，因为那些"失败"的请求有一部分其实
 已经到达 Google 并被计数（慢速档实际发出 195 次才换到 166 次成功，真实消耗高 17%）。
 别指望靠重试失败请求多榨产能。
 
-**被拦之后是硬拦。** 两次独立复测各探测 30 次、间隔 20s、跨约 10 分钟，合计 60 次
-零成功。恢复时长未测，只能说封禁后 20 分钟内没有漏网。
+**被拦之后是硬拦，约两小时自动恢复。** 两次独立复测各探测 30 次、间隔 20s、
+跨约 10 分钟，合计 60 次零成功；继续探测到 **106-121 分钟**之间恢复正常。
+代理池的熔断冷却默认取 120 分钟就是照这个来的。
 
-对照：10 个 IP 各打 50 次（418 请求）零次 Google 拒绝。默认 `per_ip_rph=80` 落在实测
-区间下沿，不需要调。
+对照：10 个 IP 各打 50 次（418 请求）零次 Google 拒绝。默认 `per_ip_rph=80` 落在突发
+档实测区间的下沿。
 
 **怎么解决**：在管理面板「代理池」页面加多个代理，**每个代理是一个独立的 IP slot**，享有独立的并发/RPM/RPH 配额。N 个代理 = N 倍总容量。
 
@@ -399,8 +487,8 @@ JSON 形式 `{"cookie": "SID=...; ...", "sapisid": "..."}` 也吃。带 `SAPISID
 - 失败 5 次自动熔断（管理面板可手动重置）
 - 全部代理满 → 返回 HTTP 429（不消耗 Google 配额，等空位再重试）
 
-**不读 `HTTPS_PROXY` / `ALL_PROXY` 环境变量。** 代理只从代理池或「设置」页的静态代理
-（`--proxy` / `config.json` 同义）里取——否则宿主机上一个随手 export 的变量会悄悄改变
+**不读 `HTTPS_PROXY` / `ALL_PROXY` 环境变量。** 代理只从代理池里取
+（`--proxy` / `config.json` 只是启动时往池子里播种）——否则宿主机上一个随手 export 的变量会悄悄改变
 出口 IP，而面板显示的还是直连，排查时会误判。
 
 ## 指纹模拟
@@ -444,7 +532,7 @@ Chrome 指纹得有别的理由（比如担心长期账号画像），不能指�
 | `n` > 1 | ❌ | 返回 400。上游只给一个候选，静默按 1 处理会让客户端少拿结果 |
 | 采样参数 | ➖ | `temperature` / `top_p` / `max_tokens` / `stop` / `seed` / `presence_penalty` / `frequency_penalty` **收下即忽略，不报错**。Gemini 网页协议没有这些旋钮 |
 | `response_format` / `logprobs` | ➖ | 未实现，收下即忽略 |
-| Vision / 图片输入 | ❌ | 传 `image_url` 返回 400。匿名**能**上传（`content-push.googleapis.com/upload/` 两步 resumable，返回 `/contrib_service/ttl_1d/…`），但对话引用该文件被上游拒绝（`BardErrorInfo 1100`），需要登录态 |
+| Vision / 图片输入 | ⚠️ | **挂 cookie 时可用**：`image_url`（chat）和 `input_image`（responses）都认，支持 `data:` URL 和 http(s) 链接，单张 12MB 封顶。匿名态返回 400——匿名**能**把图传上去（`content-push.googleapis.com/upload/` 两步 resumable），但对话里引用被上游拒绝（`BardErrorInfo 1100`） |
 | Audio | ❌ | 传 `input_audio` 返回 400。网页端有音乐生成（Lyria 3），需要登录态 |
 
 ## 项目结构
@@ -465,7 +553,12 @@ internal/app/              全部实现
   apikey.go                API key（启动参数锁定 / 面板可轮换 双轨）
   db.go                    SQLite schema：sessions / requests / accounts / kv
   proxy.go                 代理池 CRUD + 容量调度 + 熔断
-  cookie_pool.go           Cookie 池数据层（CRUD + 最久未用优先挑选 + 健康度回写）
+  cookie_pool.go           Cookie 池数据层（CRUD + 最久未用优先挑选 + 健康度回写 + 刷新项合并）
+  rotate.go                会话保活（accounts.google.com/RotateCookies，间隔由服务端指定）
+  upload.go                附件上传（content-push 两步 resumable）
+  context_file.go          超长对话转文本附件
+  vision.go                图片输入：data: URL / http(s) 链接 → 待上传附件
+  bl.go                    上游前端版本号 bl 自动跟随
   scheduler.go             小时/天聚合 + 过期明细清理
   runtime.go               运行时配置快照（面板改完即时生效）
   admin.go                 /admin/api/* 鉴权 + REST
@@ -480,10 +573,11 @@ docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
 
 ## 限制
 
-- **单 IP 上限**：实测 **80-180 次请求**后被重定向到 sorry 页，区间这么宽是因为主要由**连接策略和出口质量**决定，不由请求快慢决定：同样并发 10，复用连接池能打到 172/177，每次新建连接只有 106/109。默认 `per_ip_rph=80` 取的是区间下沿 → 要放大产能配代理池
-- **登录态功能**：生图、音乐、视频、深度研究、画布都没实现（协议已验证可用，缺的是请求参数位）
+- **单 IP 上限**：突发地打，实测 **80-180 次请求**后被重定向到 sorry 页（连接复用能多打约 60%：并发 10 时复用 172/177、每次新建 106/109）。但**平缓打几乎打不满**——静态 IP 上 10 次/分钟连打 800 次没被拦。默认 `per_ip_rph=80` 取的是区间下沿 → 要放大产能配代理池，或按低速率跑并调高限额
+- **登录态功能**：生图（`gemini-image`）、音乐（`gemini-music`）已实现；视频、深度研究、画布没实现（视频免费号被拒，深度研究是多步异步流程）
 - **Function calling**：prompt 级实现，模型不一定每次都按格式返回（OpenAI 真协议层我们做不到）
-- **多模态**：暂不支持。网页协议支持图片/文件上传、生图、音乐、视频，但都要登录态，本项目尚未实现
+- **多模态**：读图要挂 cookie；生图/音乐挂 cookie 可用（`gemini-image` / `gemini-music`），视频生成尚未实现
+- **长上下文有两堵墙**：请求体约 13 万字节、附件约 16 万字节（后者是模型能看到的内容**总量**，切成多份附件不涨额度）。挂 cookie 只能把可用长度从 13 万提到约 16 万，真正的长对话仍需客户端自己压缩
 - **token 数**：用 tiktoken 估算（Gemini 真 tokenizer 未公开），跟真值偏差 ±20% 以内
 - **Cookie 池不自动摘除坏号**：请求成败会回写（只把 401/403 算作 cookie 的错，网络错误和 302 拦截不算），但失败到一定次数不会自动禁用，得看面板手动停。另外 `last_ok_at` 只说明"这个 cookie 参与的请求成功过"，不等于它仍然有效——cookie 过期后 Gemini 不报错，只是把你当匿名用户，纯文本请求照样 200
 - **假流式的那一半**：`/v1/responses` 和带 `tools` 的 chat 请求都是收完再发，只有普通 chat 流式是真增量
@@ -496,6 +590,7 @@ docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
 | 面板诊断显示 **302 → `google.com/sorry/index`** | 这个出口 IP 被 Google 拦了（80-180 次请求后，取决于连接策略和出口质量） | 换出口/加代理。**是硬拦不是概率性**（被拦后 60 次探测零成功），原地重试没有意义 |
 | 偶发空响应、面板记为上游拒绝 | 上游瞬时拒绝（`1155`），没有可预测阈值，跟频率/并发/累积次数都无关 | 重发一次通常就好。**降 RPM 解决不了**，实测跟频率无关 |
 | 请求全部超时 | 本机到 `gemini.google.com` 不通 | 配代理（面板「代理池」或 `--proxy`）。注意**不读 `HTTPS_PROXY` 环境变量** |
+| 启动即退出，报 `unable to open database file (14)` | 容器以 nonroot(uid 65532) 运行，而 bind mount 的宿主目录属主是 root，写不进去 | 改用具名卷（compose 默认已是），或 `sudo chown -R 65532:65532 ./data` |
 | 选 `gemini-3.1-pro` 直接报错 | 没配 cookie 时它不暴露，这是故意的 | 挂 cookie（面板「设置」或「Cookie 池」）后即可用 |
 | 挂了 cookie 后请求全部 502 | cookie 已失效，取不到 XSRF token | 重新导出 cookie。判据：请求 `gemini-3.1-pro` 若回报 3.5 Flash-Lite 就是失效了 |
 | 面板打不开 / 401 | `--admin-token`（或 `ADMIN_TOKEN`）没对上 | token 留空则不鉴权，只有绑 127.0.0.1 时才可接受 |

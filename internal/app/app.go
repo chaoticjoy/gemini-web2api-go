@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -75,8 +76,9 @@ func Run() {
 	// boot DB and load proxy pool
 	getDB()
 	initRuntimeConfig() // 面板改过的运行时配置盖在启动配置之上
-	initCookie()        // 面板存的 cookie 优先于 --cookie-file
 	loadProxies()
+	seedProxiesFromConfig() // --proxy / 遗留静态代理并进代理池
+	seedCookiesFromConfig() // --cookie-file / 遗留单 cookie 并进 cookie 池
 	resolvedAPIKey := initAPIKey(*apiKey)
 	initTokenizer()
 	startScheduler()
@@ -112,6 +114,9 @@ func Run() {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		}
 	}))
+	// MCP over HTTP（Streamable HTTP）：跟 OpenAI 接口同进程同端口，暴露 web_search。
+	// 用同一把 API key 鉴权，客户端配 Authorization: Bearer <key> 连这个 URL。
+	mux.HandleFunc("/mcp", requireAPIKey(handleMCPHTTP))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			handleRoot(w, r)
@@ -136,7 +141,6 @@ func Run() {
 		mux.HandleFunc("/admin/api/apikey", requireAuth(handleAdminAPIKey))
 		mux.HandleFunc("/admin/api/usage", requireAuth(handleAdminUsage))
 		mux.HandleFunc("/admin/api/config", requireAuth(handleAdminConfig))
-		mux.HandleFunc("/admin/api/cookie", requireAuth(handleAdminCookie))
 		mux.HandleFunc("/admin/api/cookies", requireAuth(handleAdminCookies))
 		mux.HandleFunc("/admin/api/cookies/", requireAuth(handleAdminCookieItem))
 		mux.HandleFunc("/admin/api/test", requireAuth(handleAdminTest))
@@ -151,17 +155,12 @@ func Run() {
 	}
 
 	cookieStatus := "none (anonymous)"
-	if hasCookie() {
-		cookieStatus = "yes"
-		if cfg.CookieFile != "" && kvGet("google_cookie") == "" {
-			cookieStatus += " (" + cfg.CookieFile + ")"
-		} else {
-			cookieStatus += " (admin panel)"
-		}
+	if total, enabled := accountCount(); enabled > 0 {
+		cookieStatus = fmt.Sprintf("%d/%d in pool", enabled, total)
 	}
-	proxyStatus := rtCfg().Proxy
-	if proxyStatus == "" {
-		proxyStatus = "none"
+	proxyStatus := "none (direct)"
+	if n := len(listProxies()); n > 0 {
+		proxyStatus = fmt.Sprintf("%d in pool", n)
 	}
 	var modelNames []string
 	for n := range availableModels() {
@@ -195,9 +194,34 @@ func Run() {
 		rtCfg().PerIPConcurrent, rtCfg().PerIPRPM, rtCfg().PerIPRPH)
 	fmt.Printf("  Retry:       %dx / %ds\n", rtCfg().RetryAttempts, rtCfg().RetryDelaySec)
 	fmt.Println()
+	warnEnvProxyIgnored()
 
 	if err := server.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// warnEnvProxyIgnored 在设了代理环境变量、但代理池是空的时候提醒一句。
+//
+// Linux 上的惯例是 HTTP 客户端自动读 HTTP_PROXY / ALL_PROXY（Go 标准库有现成的
+// http.ProxyFromEnvironment），我们用的是显式 http.ProxyURL，一个都不读。这是
+// 有意的：宿主机上随手一个 export 会悄悄改变出口 IP，而面板仍显示直连，排查时
+// 会被带偏。但"没生效且毫无反馈"同样难查 —— 有用户按 systemd drop-in 的常规做法
+// 注入了这几个变量，折腾很久才发现要在面板配。所以不读归不读，得说一声。
+func warnEnvProxyIgnored() {
+	// 大小写两种写法都查，但只报一个名字：Windows 的环境变量大小写不敏感，
+	// 全列出来会变成 "HTTPS_PROXY / https_proxy" 这种看着像两个变量的噪音。
+	var set []string
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"} {
+		if os.Getenv(k) != "" || os.Getenv(strings.ToLower(k)) != "" {
+			set = append(set, k)
+		}
+	}
+	if len(set) == 0 || len(listProxies()) > 0 {
+		return
+	}
+	fmt.Printf("  ⚠ 检测到代理环境变量 %s，但本程序**不读**它们，当前走直连。\n"+
+		"    请在面板「代理池」添加，或用 --proxy 启动参数（它会在启动时导入代理池）。\n\n",
+		strings.Join(set, " / "))
 }

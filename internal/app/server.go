@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Version = "4.0.0"
+const Version = "4.4.0"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -65,7 +65,9 @@ func buildUsage(prompt, text string, responsesAPI bool) map[string]int {
 // 单列在 completion_tokens_details.reasoning_tokens 里，跟 OpenAI 的做法一致，
 // 想计费的人自己加。
 func buildUsageWithReasoning(prompt, text, reasoning string, responsesAPI bool) map[string]int {
-	in, out := countTokens(prompt), countTokens(text)
+	// 媒体产物是 base64 data URL，上百万字符。不计进 output token：那是二进制内容，
+	// 按 token 计费等于让用户为看不见的字节买单，下游 newapi 按 output token 收钱。
+	in, out := countTokens(prompt), countTokens(stripDataURLs(text))
 	if responsesAPI {
 		return map[string]int{
 			"input_tokens":  in,
@@ -105,8 +107,13 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
 			}
 			switch getStr(cm, "type") {
 			case "image_url", "input_image":
-				return fmt.Errorf("image input not supported: upload works anonymously but " +
-					"referencing the file is rejected upstream (needs a signed-in session)")
+				// 有 cookie 就能收：图会被上传成附件再引用。匿名不行 —— 传得上去，
+				// 但一引用就被服务端拒，收下只会让客户端拿到一个看不懂的失败。
+				if !hasCookie() {
+					return fmt.Errorf("image input needs a Google account cookie: anonymous " +
+						"uploads succeed but referencing them in a conversation is rejected " +
+						"upstream. Add a cookie in the admin panel (Cookie pool)")
+				}
 			case "input_audio":
 				return fmt.Errorf("audio input not supported")
 			}
@@ -115,15 +122,30 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
 	return nil
 }
 
-func callGemini(prompt string, mc ModelConfig, tools []map[string]interface{},
-	onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
-	res, err := streamGenerate(prompt, mc, onDelta, onReasoning)
+func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interface{},
+	images []pendingUpload, onDelta, onReasoning func(string)) (string, []ToolCall, *StreamResult, error) {
+	res, err := streamGenerateWithFiles(prompt, latest, mc, images, onDelta, onReasoning)
 	if err != nil {
-		return "", nil, nil, err
+		// res 非 nil：失败时它只带归属（哪个号 / 哪个出口），给 recordRequest 用
+		return "", nil, res, err
 	}
 	text := extractResponseText(res.Raw)
+	// 媒体模型（生图/音乐）：生成 200 了但产物字节没取回来，直接报错而不是返回一个
+	// 只有文字没有图的半成品 —— 客户端要的就是那张图/那段乐。
+	if mc.Tool == toolImage || mc.Tool == toolMusic {
+		if len(res.Artifacts) == 0 {
+			msg := res.MediaErr
+			if msg == "" {
+				msg = "媒体产物取回失败"
+			}
+			return "", nil, res, fmt.Errorf("media generation succeeded but artifact retrieval failed: %s", msg)
+		}
+		// 产物以 base64 data URL 追加到正文（可能没正文，只有图）。
+		text = appendArtifactMarkdown(text, res.Artifacts)
+		return text, nil, res, nil
+	}
 	if text == "" {
-		// 上游拒绝时只回一个结束帧、没有内容帧（实测多轮会话 id 被拒时 raw 仅 216
+		// 上游拒绝时只回一个结束帧、没有内容帧（实测被拒时 raw 仅 216
 		// 字节）。这种情况必须报错：以前会当成空回复返回 200 + content:null，
 		// 客户端看不出请求其实失败了。
 		// 注意不能用 BardErrorInfo 判错 —— 正常响应的结束帧里也带这个码。
@@ -140,6 +162,9 @@ func callGemini(prompt string, mc ModelConfig, tools []map[string]interface{},
 // Privacy: the prompt/response strings themselves are never persisted —
 // only their length, model name, latency, status, and proxy info.
 func recordRequest(endpoint, model, prompt, response string, res *StreamResult, status int, errStr string, stream bool) {
+	// 媒体产物是超长 base64，剥掉再算 token/长度：既不让它污染统计，也免得在请求线程里
+	// 对上百万字符跑 tiktoken 白白拖慢。
+	response = stripDataURLs(response)
 	r := &RequestRow{
 		TS:            time.Now().Unix(),
 		Model:         model,
@@ -162,6 +187,10 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 			r.ProxyID = &res.ProxyID
 		}
 		r.ProxyName = res.ProxyName
+		if res.AccountID > 0 {
+			r.AccountID = &res.AccountID
+		}
+		r.AccountLabel = res.AccountLabel
 	}
 	if r.ProxyName == "" {
 		mode := rtCfg().ProxyMode
@@ -231,8 +260,16 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt := messagesToPrompt(messages, tools, req["tool_choice"])
-	if strings.TrimSpace(prompt) == "" {
+	// 图片先解出来带着，真正上传要等挑完账号和出口（见 streamGenerate）。
+	images, err := collectImages(messages, "")
+	if err != nil {
+		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+			"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+
+	prompt, latest := messagesToPrompt(messages, tools, req["tool_choice"])
+	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty prompt"}})
 		return
 	}
@@ -246,23 +283,36 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	cid := "chatcmpl-" + randHex(12)
 	created := time.Now().Unix()
 
-	// 只有无 tools 时才真流式：tool_call 块必须拿到完整文本才能 regex 解析，
-	// 边出边转发会把 ```tool_call``` 原文推给客户端。
+	// 带 tools 时正文过一道围栏闸门：```tool_call``` 块要完整文本才能解析，
+	// 直接转发会把围栏原文推给客户端，所以只放行确定不在围栏里的部分。
+	// 思考链跟围栏无关，两种情况都直接流。
 	var sse *sseWriter
+	var gate *toolFenceGate
 	var onDelta, onReasoning func(string)
 	if stream {
 		sse = newSSEWriter(w, cid, created, modelName)
+		onReasoning = sse.SendReasoning
 		if len(tools) == 0 {
 			onDelta = sse.SendContent
-			onReasoning = sse.SendReasoning
+		} else {
+			gate = newToolFenceGate(sse.SendContent)
+			onDelta = gate.Push
 		}
 	}
 
-	text, toolCalls, res, err := callGemini(prompt, modelCfg, tools, onDelta, onReasoning)
+	text, toolCalls, res, err := callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
 	if err != nil {
-		recordRequest("chat.completions", modelName, prompt, "", nil, 502, err.Error(), stream)
+		recordRequest("chat.completions", modelName, prompt, "", res, 502, err.Error(), stream)
 		if sse != nil && sse.Started() {
 			sse.Fail(err) // 已经开流，HTTP 状态码改不了了
+			return
+		}
+		if ptl, ok := err.(*PromptTooLongError); ok {
+			// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
+			// 一个答非所问的 200，根本看不出请求其实没送到。
+			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+				"message": ptl.Error(), "type": "invalid_request_error",
+				"code": "context_length_exceeded"}})
 			return
 		}
 		if rle, ok := err.(*RateLimitError); ok {
@@ -307,7 +357,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				sse.SendReasoning(rest)
 			}
 		}
-		if rest := remainingText(text, res); rest != "" {
+		// 补尾巴要跟**实际发给客户端的内容**比。走了闸门时 res.Emitted 含围栏
+		// 原文，拿它比前缀会对不上，尾巴会整段丢掉。
+		if rest := remainingOf(text, sentText(res, gate)); rest != "" {
 			sse.SendContent(rest)
 		}
 		if len(toolCalls) > 0 {
@@ -347,6 +399,19 @@ func remainingText(text string, res *StreamResult) string {
 		return text
 	}
 	return remainingOf(text, res.Emitted)
+}
+
+// sentText 返回本次实际发给客户端的正文。
+// 没走围栏闸门时就是 deltaTracker 发出的那些；走了闸门时以闸门为准 ——
+// 闸门扣掉了围栏，跟 res.Emitted 不是同一份文本。
+func sentText(res *StreamResult, gate *toolFenceGate) string {
+	if gate != nil {
+		return gate.Sent()
+	}
+	if res == nil {
+		return ""
+	}
+	return res.Emitted
 }
 
 // remainingOf 返回 full 里还没发出去的尾巴。emitted 为空时返回全文。
@@ -486,8 +551,15 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	prompt := messagesToPrompt(messages, tools, req["tool_choice"])
-	if strings.TrimSpace(prompt) == "" {
+	images, err := collectImages(messages, "")
+	if err != nil {
+		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+			"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+
+	prompt, latest := messagesToPrompt(messages, tools, req["tool_choice"])
+	if strings.TrimSpace(prompt) == "" && len(images) == 0 {
 		writeJSON(w, 400, map[string]interface{}{"error": map[string]string{"message": "empty input"}})
 		return
 	}
@@ -496,16 +568,19 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	rid := "resp_" + randHex(16)
 	mid := "msg_" + randHex(12)
 
+	// 流式要先把头和 response.created 发出去，才能边收边推 delta。
+	// 代价是一旦开了流 HTTP 状态码就改不了了，上游失败只能用 response.failed
+	// 事件告知 —— 跟 /v1/chat/completions 那条路的取舍一致。
+	var writeEvent func(string, interface{})
+	var emitDelta func(string)
+	var gate *toolFenceGate
 	var onDelta func(string)
-	var flusher http.Flusher
-	var writeEvent func(eventType string, payload interface{})
-
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(200)
-		flusher, _ = w.(http.Flusher)
+		flusher, _ := w.(http.Flusher)
 		writeEvent = func(eventType string, payload interface{}) {
 			pj, _ := json.Marshal(payload)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, pj)
@@ -513,7 +588,6 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		}
-
 		writeEvent("response.created", map[string]interface{}{
 			"type": "response.created",
 			"response": map[string]interface{}{
@@ -524,33 +598,58 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"output": []interface{}{},
 			},
 		})
-
-		onDelta = func(delta string) {
+		emitDelta = func(d string) {
 			writeEvent("response.output_text.delta", map[string]interface{}{
 				"type":          "response.output_text.delta",
-				"response_id":    rid,
-				"item_id":        mid,
-				"output_index":   0,
-				"content_index":  0,
-				"delta":         delta,
+				"item_id":       mid,
+				"content_index": 0,
+				"delta":         d,
 			})
+		}
+		// 跟 chat 那条路同一套围栏闸门：带 tools 时只放行确定不在围栏里的部分。
+		if len(tools) == 0 {
+			onDelta = emitDelta
+		} else {
+			gate = newToolFenceGate(emitDelta)
+			onDelta = gate.Push
 		}
 	}
 
-	text, toolCalls, res, err := callGemini(prompt, modelCfg, tools, onDelta, nil)
+	// onReasoning 传 nil：Responses API 有自己的 reasoning 事件形状，跟 chat 的
+	// reasoning_content 不通用，这条路目前不暴露思考链。
+	text, toolCalls, res, err := callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
 	if err != nil {
-		recordRequest("responses", modelName, prompt, "", nil, 502, err.Error(), stream)
-		if !stream {
-			if rle, ok := err.(*RateLimitError); ok {
-				writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
-					"message": rle.Error(),
-					"type":    "rate_limit_exceeded",
-					"code":    "ip_slot_full",
-				}})
-				return
-			}
-			writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
+		recordRequest("responses", modelName, prompt, "", res, 502, err.Error(), stream)
+		if stream {
+			writeEvent("response.failed", map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id":     rid,
+					"object": "response",
+					"status": "failed",
+					"model":  modelName,
+					"error":  map[string]string{"message": err.Error()},
+				},
+			})
+			return
 		}
+		if ptl, ok := err.(*PromptTooLongError); ok {
+			// 明确报 400 而不是发出去让上游把用户的问题截掉 —— 那样客户端拿到的是
+			// 一个答非所问的 200，根本看不出请求其实没送到。
+			writeJSON(w, 400, map[string]interface{}{"error": map[string]string{
+				"message": ptl.Error(), "type": "invalid_request_error",
+				"code": "context_length_exceeded"}})
+			return
+		}
+		if rle, ok := err.(*RateLimitError); ok {
+			writeJSON(w, 429, map[string]interface{}{"error": map[string]string{
+				"message": rle.Error(),
+				"type":    "rate_limit_exceeded",
+				"code":    "ip_slot_full",
+			}})
+			return
+		}
+		writeJSON(w, 502, map[string]interface{}{"error": map[string]string{"message": "upstream error: " + err.Error()}})
 		return
 	}
 
@@ -581,6 +680,10 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	recordRequest("responses", modelName, prompt, text, res, 200, "", stream)
 	if stream {
+		// 补上闸门扣住、或前缀 diff 跳过的尾巴，再发终态事件。
+		if rest := remainingOf(text, sentText(res, gate)); rest != "" {
+			emitDelta(rest)
+		}
 		for _, item := range output {
 			switch item["type"] {
 			case "function_call":

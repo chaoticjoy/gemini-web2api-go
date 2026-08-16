@@ -21,10 +21,13 @@ func startScheduler() {
 		daily := time.NewTicker(1 * time.Hour)
 		retention := time.NewTicker(6 * time.Hour)
 		proxyReload := time.NewTicker(60 * time.Second)
+		// 会话保活：服务端在轮转页里指定间隔（实测 600 秒），按它给的值走。
+		rotate := time.NewTimer(defaultRotateInterval)
 		defer hourly.Stop()
 		defer daily.Stop()
 		defer retention.Stop()
 		defer proxyReload.Stop()
+		defer rotate.Stop()
 
 		for {
 			select {
@@ -36,6 +39,8 @@ func startScheduler() {
 				retentionSweep()
 			case <-proxyReload.C:
 				loadProxies()
+			case <-rotate.C:
+				rotate.Reset(rotateAllAccounts())
 			}
 		}
 	}()
