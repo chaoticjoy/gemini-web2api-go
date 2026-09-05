@@ -2,6 +2,144 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 4.15.0
+
+### 新增
+
+- **`/v1/videos` 端点**（issue #24）。OpenAI(Sora) 形状的异步视频生成：`POST /v1/videos`
+  {model, prompt} 建任务、立即返回 `{id, status}`；`GET /v1/videos/{id}` 轮询状态；
+  `GET /v1/videos/{id}/content` 完成后下 MP4。底层复用 `gemini-video` 那条生成链（要登录态 Pro 号）。
+  视频要几十秒到几分钟，异步比 chat/completions 阻塞式更合适。原来 `/v1/chat/completions` +
+  `model=gemini-video`（返回 base64 data URL）仍保留可用。
+
+## 4.14.0
+
+### 新增
+
+- **MySQL / PostgreSQL 支持**（issue #22）。设 `SQL_DSN` 环境变量即可，不设仍默认 SQLite、无需改动。
+  `SQL_DSN=mysql://user:pass@host:3306/db` 或 `postgres://user:pass@host:5432/db?sslmode=disable`。
+  建表自动完成，三种库共用一套 schema；方言差异（`?`/`$N` 占位符、upsert、自增主键、TEXT 键列、
+  `IFNULL`/`COALESCE`）全收敛在 `dbdialect.go`，业务层 ~70 条查询不动。用真 mysql8 + pg16 各跑通验证。
+
+### 修复
+
+- SSE 响应补 `X-Accel-Buffering: no`，避免流式经 nginx 一类反代被整体缓冲成一次性下发
+  （客户端直连本就是流式，仅「自己在前面架了反代」的部署需要）。注：issue #21 里 Dify 的
+  一次性输出不是这个原因——实测经 Dify 的 squid(ssrf_proxy) 是流式透传的，那问题在 Dify 侧。
+
+## 4.13.0
+
+### 新增
+
+- **读视频**。客户端在 content 里传 `video_url` / `input_video`（data URL）即可让模型分析
+  视频内容，跟读图同一条上传路径（文件元组类型位 2=视频）。要 cookie（匿名引用被上游拒）。
+  实测传红→绿→蓝测试片、问依次哪三色，模型答「红、绿、蓝」——真逐帧看了。
+- **生视频**（`gemini-video`）。`inner[49]=11` 提交异步任务，轮询 hNvQHb 拿
+  `contribution.usercontent.google.com` 下载链，取回 MP4（base64 data URL）。实测「日落
+  海浪」出真 10 秒 720p H.264+AAC 视频。**要 Pro/付费号**（自报 3.7 Flash）；免费号被
+  Google 视频内容政策拒时会明确报错。生成要几十秒到几分钟，客户端记得配长超时。
+- **自动删会话**（issue #19，配置 `auto_delete_conversation`，默认关）。出完结果自动删掉
+  gemini.google.com 上留下的这条会话（rpc GzXR5e），免得账号里堆一堆。只登录态生效，
+  异步 best-effort 不影响响应。
+
+## 4.12.0
+
+### 修复
+
+- **agentic 客户端的工具循环收敛**（承接 #15）。Codex 这类客户端的命令成功结果是一段
+  带「Process exited with code 0 / Output:（空）」的包装文本；写文件、设值这类命令没有
+  stdout，弱模型（尤其匿名 3.6 Flash）把「无输出」当成「没干成」，于是换个写法一遍遍重试
+  ——实测「写 hello 到 a.txt」一个任务试了 26 种命令、90 秒不收敛（文件其实第一次就写对了）。
+  现在把工具结果压成一行清爽的成功/失败信号（✅ exit 0 并说明无输出是正常的、别重跑；
+  ❌ exit N），并在指令里加终止条款（看到成功就停、别重试同一件事）。实测同一任务从
+  26-27 轮降到 2-4 轮、且正常给出最终答复。只加终止条款不配清爽信号无效，两者要一起。
+
+## 4.11.0
+
+### 修复
+
+- **带 tools 的请求「已读乱回」**（issue #15）。agentic 客户端（Codex 等）发来的请求，中间
+  夹着几十 KB 客户端自带的开发者提示，里面写着「emit function calls to run terminal
+  commands」这类原生工具框架措辞，把我们放在最顶部的 ```tool_call``` 格式指令冲没——模型
+  于是答「我没有工具 / 无法访问文件系统」或答非所问。现在 `buildPrompt` 在所有消息之后
+  （紧挨用户问题）再锚一次工具格式（含一个行为化示例，明确唯一执行通道是 ```tool_call```、
+  不许写 ```powershell 代码块给用户看、一次只发一个），并放宽围栏正则以容错模型吐的 inline
+  变体（无换行）。实测 Codex 真实客户端下工具正常调用；有 tools 时普通对话不误触发。
+- **纯代码产物响应不再返空导致 502**。问数学 / 算式时模型直接跑代码、整条回复只有代码执行
+  产物，清洗掉 `?code_reference/stdout` 标记后为空，会被当「无内容帧」报 502。现在清洗后为空
+  时保留代码和结果、当普通代码块返回。
+
+## 4.10.0
+
+### 新增
+
+- **`gemini-canvas`（画布）**。生成 immersive 交互 HTML 文档。跟生图/音乐不同，产物是
+  HTML、**内联在响应里**（一个 ```html 代码块），不用另外下载。要 cookie，没配时不暴露。
+  实测返回完整的 `<!DOCTYPE html>…</html>` 交互网页（含脚本），客户端拿到后可提取渲染。
+
+## 4.9.0
+
+### 新增
+
+- **管理面板中英切换**（issue #13）。顶栏加了个语言按钮，默认中文，点一下切英文
+  （记在 localStorage）。约 190 条词条覆盖导航、KPI、表头、按钮、下拉、状态徽章、
+  运行时配置字段与提示、错误分类、连通性诊断、弹窗、部署表。带数字变量的插值句
+  （如"还能再打约 N 次"）保持中文。
+
+## 4.8.0
+
+### 修复
+
+- **生图取原图**（issue #14）。plain gg-dl 链默认下来是 ~500px（512×279）的缩略图；
+  在链尾加 `=s0` 取原始尺寸后拿到全分辨率（实测 1408×768）。格式仍是 PNG。
+- **媒体模型不再被多轮路径吞掉产物**。4.5.0 起把多轮 gate 放宽到带 tools 的请求时，
+  把媒体模型（生图/音乐）也放进了多轮路径，而多轮只处理文本——于是开了 `multi_turn`
+  再打 `gemini-image` / `gemini-music` 只回一句占位文本、没有图/乐。现在媒体模型始终
+  走带产物取回的那条路，跟 `multi_turn` 开关无关。
+
+## 4.7.0
+
+### 新增
+
+- **`gemini-3.7-flash`（含 `-thinking` 版）**。Gemini 网页端按账号灰度放出 3.7 Flash，
+  接进来。要配 cookie，且**账号得已灰度到 3.7**，否则降级成 3.5 Flash-Lite（跟 3.1 Pro
+  一样，没 cookie / 没灰度就不给假成功）。
+
+  hex 用 3.7 条目的主 hex `56fdd199312815e2`（两个独立已灰度账号的 otAQ7b 清单里都是它、
+  有 3.7 号的用户实测发它回报 "3.7 Flash"）。没用 compat 列表里的 `797f3d0293f288ad`——
+  那是「当前 Flash」泛指针，老批次号发它拿到的是 3.6，会拿 3.6 冒充 3.7。
+
+## 4.6.0
+
+### 修复
+
+- **流式 `tool_calls` 补 `index` 字段**（issue #10）。流式 delta 里的每个 tool_call 少了
+  `index`，OpenAI 流式规范要求客户端靠它把分片的 tool_call 拼起来；漏了导致部分客户端
+  拼不起来。现在按顺序给每个补上。
+
+## 4.5.0
+
+### 修复
+
+- **`/v1/responses` 流式补全 item 生命周期事件**。以前只发 `response.created` 就直接推
+  `output_text.delta`，漏了先用 `response.output_item.added` + `content_part.added` 声明
+  item。严格的 Responses 客户端（Codex、zcode 等）收到不合规的事件序列会中途报错
+  （"OutputTextDelta without active item" / "Turn execution failed"），而 HTTP 请求本身
+  返回 200、chat 模式不受影响，所以面板看着正常、很难定位。现在补齐了 message 和
+  function_call 两种 item 的 added → content_part → done 完整生命周期。
+
+### 新增
+
+- **可选多轮（`multi_turn`，默认关）**。开启后走 Gemini 原生 conversation_id 服务端续接：
+  客户端每轮重发全历史，服务端按"除最后一条外的历史"做指纹识别续接，命中就只发最后一句
+  新消息、历史留 Google 服务端，绕开单请求约 13 万字节的墙。登录 / 匿名都可用（匿名首轮
+  就地 GET /app 拿 session cookie 当会话载体，不需要账号）。带 tools 的 agentic 客户端
+  也走这条。
+
+  实测：两轮各 110KB、全量重发会撞字节墙报 400 的场景，续接只发新消息 → 200，长会话
+  不再撞墙。注意多轮**不放大模型的上下文窗口**——超出窗口的早期内容仍会被挤出（滑动窗口
+  留最近），它解决的是"长对话不撞单请求墙 + 保住最近上下文"，不是"喂超长文档"。
+
 ## 4.4.0
 
 ### 新增

@@ -106,3 +106,52 @@ func TestParseRemoteProxyItems(t *testing.T) {
 		t.Fatalf("failed textLines parse: %v, %v", err, items)
 	}
 }
+
+func TestProxyModeAcquireSlot(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(RemoteProxyItem{
+			URL:  "socks5://127.0.0.1:1080",
+			Type: "socks5",
+		})
+	}))
+	defer ts.Close()
+
+	// 1. direct_only
+	rtMu.Lock()
+	rtVal.ProxyMode = "direct_only"
+	rtVal.ProxyPoolURL = ts.URL
+	rtMu.Unlock()
+	p, ok, err := acquireSlot(0)
+	if !ok || err != nil || p.ID != 0 {
+		t.Fatalf("direct_only failed: p=%+v, ok=%v, err=%v", p, ok, err)
+	}
+	releaseSlot(p.ID)
+
+	// 2. dynamic_only
+	rtMu.Lock()
+	rtVal.ProxyMode = "dynamic_only"
+	rtMu.Unlock()
+	p, ok, err = acquireSlot(0)
+	if !ok || err != nil || p.ID >= 0 || p.URL != "socks5://127.0.0.1:1080" {
+		t.Fatalf("dynamic_only failed: p=%+v, ok=%v, err=%v", p, ok, err)
+	}
+	releaseSlot(p.ID)
+
+	// 3. sticky vs round_robin
+	rtMu.Lock()
+	rtVal.ProxyStrategy = "sticky"
+	rtMu.Unlock()
+	pSticky, okSticky := fetchOrStickyRemoteProxy(ts.URL)
+	if !okSticky || pSticky.URL != "socks5://127.0.0.1:1080" {
+		t.Fatalf("sticky fetch failed: %+v", pSticky)
+	}
+	releaseSlot(pSticky.ID)
+
+	// reset to auto
+	rtMu.Lock()
+	rtVal.ProxyMode = "auto"
+	rtVal.ProxyStrategy = "sticky"
+	rtVal.ProxyPoolURL = ""
+	rtMu.Unlock()
+}
+

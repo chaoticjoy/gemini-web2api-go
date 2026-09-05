@@ -36,6 +36,9 @@ func (s *sseWriter) start() {
 	s.w.Header().Set("Content-Type", "text/event-stream")
 	s.w.Header().Set("Cache-Control", "no-cache")
 	s.w.Header().Set("Connection", "keep-alive")
+	// 关掉反代（nginx 等）对 SSE 的整体缓冲：不发这个头，客户端直连能看到流式，
+	// 但一旦经过反代就会被攒成一坨一次性下发（Dify 那种接法就是这么变非流式的）。
+	s.w.Header().Set("X-Accel-Buffering", "no")
 	s.w.Header().Set("Access-Control-Allow-Origin", "*")
 	s.w.WriteHeader(200)
 	s.chunk(map[string]interface{}{"role": "assistant"}, nil, nil)
@@ -84,7 +87,21 @@ func (s *sseWriter) SendContent(delta string) {
 
 func (s *sseWriter) SendToolCalls(tcs []ToolCall) {
 	s.start()
-	s.chunk(map[string]interface{}{"tool_calls": tcs}, nil, nil)
+	// 流式 delta 里每个 tool_call 必须带 index，客户端靠它把分片的 tool_call 拼起来
+	// （OpenAI 流式规范要求）。ToolCall 结构本身没有 index，这里按顺序补上。
+	out := make([]map[string]interface{}, len(tcs))
+	for i, tc := range tcs {
+		out[i] = map[string]interface{}{
+			"index": i,
+			"id":    tc.ID,
+			"type":  tc.Type,
+			"function": map[string]interface{}{
+				"name":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+			},
+		}
+	}
+	s.chunk(map[string]interface{}{"tool_calls": out}, nil, nil)
 }
 
 // Finish 收尾：空 delta + finish_reason，可选 usage chunk，最后 [DONE]。

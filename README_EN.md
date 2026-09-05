@@ -29,6 +29,7 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
 
 **API**
 - OpenAI-compatible: `/v1/chat/completions`, `/v1/models`, `/v1/responses`
+- `/v1/videos`: OpenAI (Sora)-shaped async video generation — `POST` to create, `GET /v1/videos/{id}` to poll, `GET /v1/videos/{id}/content` to download the MP4 (needs a signed-in Pro cookie)
 - Real incremental streaming for plain chat (requests with `tools`, and `/v1/responses`, are buffered then sent)
 - Bearer token / `x-api-key` auth; the key can be rotated from the panel
 - `usage` computed with tiktoken; `reasoning_tokens` counted separately, not folded
@@ -51,7 +52,7 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
 
 **Operations**
 - Single binary, cross-compiled for 6 platforms; container image built on distroless
-- SQLite persistence: 30 days of per-request detail plus permanent aggregates
+- SQLite persistence: 30 days of per-request detail plus permanent aggregates (optional MySQL / PostgreSQL via `SQL_DSN`)
 - Admin panel: overview / requests / proxy pool / cookie pool / settings, with
   config changes applied without a restart
 - **Prompt and response bodies are never stored** — metadata only (length, latency,
@@ -71,6 +72,17 @@ chmod +x gemini-web2api-go_*
 ```
 
 Data lands in `./data/gemini.db` by default; pass `--db /your/path.db` to move it.
+
+To use MySQL / PostgreSQL, just set the `SQL_DSN` env var (unset = SQLite, nothing to change):
+
+```bash
+# MySQL (also accepts the native go-sql-driver form user:pass@tcp(host:3306)/dbname)
+SQL_DSN="mysql://user:pass@host:3306/dbname"
+# PostgreSQL
+SQL_DSN="postgres://user:pass@host:5432/dbname?sslmode=disable"
+```
+
+Tables are created automatically; all three backends share one schema. Single instance? Stick with the default SQLite. You only need MySQL/PG when several instances share one pool.
 
 ### Docker (no source needed)
 
@@ -229,11 +241,15 @@ Gemini's backend only recognises three models (the list comes from `batchexecute
 | `gemini-3.6-flash` | All-round, default |
 | `gemini-3.5-flash-lite` | Fast and lightweight |
 | `gemini-3.1-pro` | Most capable, **needs a cookie**; every reply carries a reasoning chain |
+| `gemini-3.7-flash` | Newer Flash, **needs a cookie on an account already rolled out to 3.7** (otherwise downgraded to 3.5 Flash-Lite) |
 | `gemini-3.6-flash-thinking` | 3.6 Flash with extended thinking; **needs a cookie** |
 | `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite with extended thinking; **needs a cookie** |
 | `gemini-3.1-pro-thinking` | 3.1 Pro with extended thinking; **needs a cookie** |
+| `gemini-3.7-flash-thinking` | 3.7 Flash with extended thinking; **needs a cookie on a 3.7-enabled account** |
 | `gemini-image` | Image generation (Nano Banana); base64 output; **needs a cookie** |
 | `gemini-music` | Music (Lyria, ~30s); base64 output; **needs a cookie** |
+| `gemini-canvas` | Canvas: generates an interactive HTML document (returned inline as a ```html block); **needs a cookie** |
+| `gemini-video` | Video generation (async, tens of seconds to a few minutes); base64 MP4 output; **needs a Pro/paid account** (free accounts are refused by the upstream content policy) |
 
 Without a cookie, `/v1/models` returns only the first two, and asking for `gemini-3.1-pro` fails with an explanation. An anonymous request for it is always silently downgraded to 3.5 Flash-Lite — better to fail at model selection than to hand back a reply that "succeeded" but isn't Pro.
 
@@ -274,9 +290,9 @@ you do want to bill for it.
 
 Anonymous calls (no cookie) only reach the two text models above plus Gemini's built-in web search. `gemini-3.1-pro` is silently downgraded to 3.5 Flash-Lite anonymously, which is why it isn't exposed at all in that case.
 
-Attaching a cookie additionally unlocks `gemini-3.1-pro`, **extended thinking for all three models**, **image input**, **a longer context** (over-long conversations are sent as a text attachment, see below), and **image generation (`gemini-image`) / music (`gemini-music`)** (see "Image & music" below).
+Attaching a cookie additionally unlocks `gemini-3.1-pro`, **extended thinking for all three models**, **image / video input**, **a longer context** (over-long conversations are sent as a text attachment, see below), and **image generation (`gemini-image`), music (`gemini-music`), canvas (`gemini-canvas`), video generation (`gemini-video`, needs a Pro account)**.
 
-Video, deep research and canvas also need a signed-in session but **are not implemented here**: video is refused for free accounts, deep research is a multi-step async flow — neither is a one-line add. The panel's "actual model" column always shows which model the backend really used, so any downgrade is visible.
+Deep research is still **not implemented** (a multi-step async flow). The panel's "actual model" column always shows which model the backend really used, so any downgrade is visible.
 
 ### Image & music
 
@@ -307,6 +323,7 @@ Saving takes effect **immediately**, no restart. Values live in the database and
 | Default model | used when the client doesn't send `model` |
 | Per-slot concurrency / RPM / RPH | rate limits, 0 = unlimited |
 | Prompt byte cap | over the cap: with a cookie the history is sent as a text attachment (usable length up to ~160,000 bytes), without one the request is rejected with 400 `context_length_exceeded`. Neither path truncates silently. Counted in UTF-8 bytes (the upstream limit is byte-based, not token-based), default 128000. 0 = unlimited |
+| Multi-turn (`multi_turn`) | off by default. When on, uses Gemini's native conversation_id server-side continuation — the client resends full history each turn, the server detects the continuation and sends only the newest message while history stays server-side, so long conversations no longer hit the single-request byte wall. Works signed-in or anonymous. **Note**: it does not enlarge the model's context window; content past the window is still evicted (recent-kept sliding window). It solves "long chat without hitting the wall + keep recent context", not "feed a huge document". |
 | Retry attempts / retry delay / upstream timeout | |
 | Detail retention days | only request details expire; aggregates are kept forever |
 | TLS fingerprint | `chrome_146` (default) / `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
@@ -363,7 +380,7 @@ Attaching a Google account cookie makes requests run as a signed-in session. Wha
 
 > Signed-in requests must carry an extra XSRF token. The project fetches it from the Gemini page automatically, caches it per cookie and re-fetches on expiry — nothing to configure. (Missing it makes **every** request fail with 400 while anonymous traffic keeps working — an earlier version hit exactly that.)
 
-A signed-in session unlocks `gemini-3.1-pro` + reasoning chain, image input, and **image generation (`gemini-image`) / music (`gemini-music`)** (see "Image & music" above). Video, deep research and canvas also need a signed-in session but **are not implemented here yet**.
+A signed-in session unlocks `gemini-3.1-pro` + reasoning chain, image/video input, **image generation (`gemini-image`) / music (`gemini-music`)** (see "Image & music" above), **canvas (`gemini-canvas`)** — an interactive HTML document returned inline — and **video generation (`gemini-video`, needs a Pro account)**. Deep research also needs a signed-in session but **is not implemented here yet**.
 
 1. Sign in to [gemini.google.com](https://gemini.google.com)
 2. DevTools (F12) → Application → Cookies → `https://gemini.google.com`
@@ -458,7 +475,7 @@ This does not change the blocking threshold, though: in a same-start comparison,
 | `GET /` | ✅ | Health check, unauthenticated, returns status/version/models |
 | `/v1beta/models/…` (Gemini CLI native) | ❌ | Not implemented, only OpenAI-shaped endpoints are exposed |
 | `/v1/embeddings`, `/v1/images/*`, `/v1/audio/*` | ❌ | Not implemented, return 404 |
-| Function calling | ⚠️ | Prompt-level implementation (the model emits a ` ```tool_call``` ` block that we parse with a regex), not a real protocol layer. **Reliable for looking up private data or internal systems**, but anything Gemini can answer itself (the weather) gets answered directly, and side-effecting actions (sending email) are refused |
+| Function calling | ⚠️ | Prompt-level implementation (the model emits a ` ```tool_call``` ` block that we parse with a regex), not a real protocol layer. **Reliable for looking up private data or internal systems**, but anything Gemini can answer itself (the weather) gets answered directly, and side-effecting actions (sending email) are refused. **Agentic clients (Codex, etc.) now work**: before 4.11.0 their tens-of-KB system prompts buried our tool instructions and caused off-topic replies; fixed now. Since 4.12.0 tool results are condensed into a clear success/failure signal, so weak models no longer misread a no-output success as a failure and loop retrying (measured: the same task dropped from 26 loops to 2-4 before it concludes) |
 | `tool_choice` | ⚠️ | `none` injects no tool definitions at all; `required` and a named function add mandatory wording and drop the other tools from the prompt. A prompt-level layer **cannot truly force it** — in testing, questions the model can answer itself (weather, 2+2) were answered directly even under `required` |
 | `stream_options.include_usage` | ✅ | Emits a usage chunk with an empty `choices` array after `finish_reason` |
 | `usage` token counts | ✅ | tiktoken cl100k_base, the same basis as the panel's requests table |
@@ -507,9 +524,9 @@ docker-compose.yml         single container, pulls the ghcr image by default, sq
 ## Limitations
 
 - **Per-IP ceiling**: when sending in bursts, measured at **80-180 requests** before the sorry-page redirect (connection reuse buys about 60%: at concurrency 10, a reused pool reached 172/177 versus 106/109 for a fresh connection per request). But **a steady pace barely reaches the ceiling at all** — 10 requests/minute on a static IP ran 800 requests without a block. `per_ip_rph=80` sits at the bottom of the burst range → use the proxy pool to scale, or pace yourself and raise the limit
-- **Signed-in features**: image generation (`gemini-image`) and music (`gemini-music`) are implemented; video, deep research and canvas are not (video is refused for free accounts, deep research is a multi-step async flow)
+- **Signed-in features**: image generation (`gemini-image`), music (`gemini-music`), canvas (`gemini-canvas`) and video generation (`gemini-video`, Pro accounts only — free accounts are refused by the content policy) are implemented; deep research is not (a multi-step async flow)
 - **Function calling**: prompt-level, the model doesn't always answer in the expected format (a real protocol layer isn't available to us)
-- **Multimodal**: image input needs a cookie. Image and music generation work with a cookie (`gemini-image` / `gemini-music`); video generation is not implemented
+- **Multimodal**: image/video input needs a cookie. Image, music, canvas and video generation work with a cookie; video generation additionally needs a Pro/paid account
 - **Long context hits two walls**: ~130,000 bytes for the request body and ~160,000 bytes for attachments (the latter is the **total** amount of content the model can see — splitting it across several attachments does not raise the budget). A cookie only takes the usable length from 130K to ~160K; genuinely long conversations still have to be compacted by the client
 - **Token counts**: tiktoken estimates (Gemini's real tokenizer is not public), within about ±20% of the true value
 - **Cookie pool never auto-removes a bad account**: outcomes are written back (only 401/403 count as the cookie's fault — network errors and 302 blocks don't), but failures never trigger an automatic disable, so you have to do it from the panel. Also `last_ok_at` only means "a request using this cookie succeeded", not that the cookie is still valid — an expired cookie doesn't error, Gemini just treats you as anonymous and plain text requests still return 200

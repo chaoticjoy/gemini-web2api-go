@@ -29,6 +29,7 @@
 
 **接口**
 - OpenAI 兼容：`/v1/chat/completions`、`/v1/models`、`/v1/responses`
+- `/v1/videos`：OpenAI(Sora) 形状的异步视频生成——`POST` 建任务、`GET /v1/videos/{id}` 轮询、`GET /v1/videos/{id}/content` 下 MP4（要登录态 Pro 号）
 - 普通对话真流式：上游每出一帧就转发增量（带 `tools` 的请求和 `/v1/responses` 是收完再发）
 - Bearer token / `x-api-key` 鉴权，key 可在面板轮换
 - `usage` 用 tiktoken 算，`reasoning_tokens` 单列不计入 `completion_tokens`
@@ -47,7 +48,7 @@
 
 **运维**
 - 单二进制，交叉编译 6 平台；容器镜像基于 distroless
-- SQLite 持久化：30 天请求明细 + 永久聚合统计
+- SQLite 持久化：30 天请求明细 + 永久聚合统计（可选 MySQL / PostgreSQL，设 `SQL_DSN` 即可）
 - 中文管理面板：概览 / 请求记录 / 代理池 / Cookie 池 / 设置，配置改完即时生效
 - **prompt 和回复内容永不入库**，只存元数据（长度、耗时、模型、状态）
 
@@ -64,6 +65,17 @@ chmod +x gemini-web2api-go_*
 ```
 
 数据默认落在 `./data/gemini.db`，换位置加 `--db /your/path.db`。
+
+想用 MySQL / PostgreSQL，设 `SQL_DSN` 环境变量即可（不设就是 SQLite，无需改动）：
+
+```bash
+# MySQL（也接受 go-sql-driver 原生 user:pass@tcp(host:3306)/dbname）
+SQL_DSN="mysql://user:pass@host:3306/dbname"
+# PostgreSQL
+SQL_DSN="postgres://user:pass@host:5432/dbname?sslmode=disable"
+```
+
+建表自动完成，三种库共用同一套 schema。单机就用默认 SQLite 最省事，多实例共享一个池子才需要 MySQL/PG。
 
 ### Docker（不用源码）
 
@@ -226,11 +238,15 @@ Gemini 网页端服务端只认三个模型（清单来自 `batchexecute?rpcids=
 | `gemini-3.6-flash` | 全方位，默认 |
 | `gemini-3.5-flash-lite` | 极速、轻量 |
 | `gemini-3.1-pro` | 最强，**要配 cookie**；每次回答都带思考链 |
+| `gemini-3.7-flash` | 新款 Flash，**要配 cookie 且账号已灰度到 3.7**（否则降级成 3.5 Flash-Lite）|
 | `gemini-3.6-flash-thinking` | 3.6 Flash 开扩展思考，**要配 cookie** |
 | `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite 开扩展思考，**要配 cookie** |
 | `gemini-3.1-pro-thinking` | 3.1 Pro 开扩展思考，**要配 cookie** |
+| `gemini-3.7-flash-thinking` | 3.7 Flash 开扩展思考，**要配 cookie 且账号已灰度** |
 | `gemini-image` | 生图（Nano Banana），产物 base64，**要配 cookie** |
 | `gemini-music` | 音乐（Lyria，约 30 秒），产物 base64，**要配 cookie** |
+| `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
+| `gemini-video` | 生视频（异步，几十秒~几分钟），产物 base64 MP4，**要 Pro/付费号**；免费号被上游内容政策拒 |
 
 没配 cookie 时 `/v1/models` 只返回前两个，选 `gemini-3.1-pro` 会直接报错并说明
 原因。因为匿名请求它必然被静默降级成 3.5 Flash-Lite——与其让客户端拿到一个
@@ -284,12 +300,11 @@ I've successfully defined..."
 匿名调用（不挂 cookie）只能拿到上面两个文本模型 + Gemini 自带的联网搜索。
 `gemini-3.1-pro` 匿名时被静默降级成 3.5 Flash-Lite，所以干脆不暴露。
 
-挂上 cookie 额外解锁：`gemini-3.1-pro`、**三个模型的扩展思考版**、**读图**、**更长的上下文**
-（超长对话自动转成文本附件发，见下文），以及 **生图（`gemini-image`）** 和
-**音乐（`gemini-music`）**（见下面「生图 / 音乐」一节）。
+挂上 cookie 额外解锁：`gemini-3.1-pro`、**三个模型的扩展思考版**、**读图 / 读视频**、
+**更长的上下文**（超长对话自动转成文本附件发，见下文），以及 **生图（`gemini-image`）**、
+**音乐（`gemini-music`）**、**画布（`gemini-canvas`）**、**生视频（`gemini-video`，要 Pro 号）**。
 
-视频、深度研究、画布也需要登录，但**本项目尚未实现**：视频免费号被上游拒，深度研究是
-多步异步流程，都不是加一行能搞定的。管理面板的「实际模型」列会把服务端实际用了哪个
+深度研究仍**未实现**（多步异步流程）。管理面板的「实际模型」列会把服务端实际用了哪个
 模型标出来，降级一眼可见。
 
 ### 生图 / 音乐
@@ -335,6 +350,8 @@ curl http://127.0.0.1:8083/v1/chat/completions \
 | 默认模型 | 客户端没传 `model` 时用哪个 |
 | 每 slot 并发 / RPM / RPH | 限流额度，0 = 不限 |
 | Prompt 字节上限 | 超了：挂 cookie 时转成文本附件发（可用长度到约 16 万字节），没挂时返回 400 `context_length_exceeded`。都不静默截断。按 UTF-8 字节算（上游的墙跟 token 无关），默认 128000。0 = 不限 |
+| 多轮（`multi_turn`） | 默认关。开启后走 Gemini 原生 conversation_id 服务端续接——客户端每轮重发全历史，服务端识别续接后只发最新一句、历史留服务端，长会话不再撞单请求字节墙。登录/匿名都可用。**注意**：不放大模型上下文窗口，超窗的早期内容仍会被挤出，解决的是"长对话不撞墙 + 保住最近上下文"，不是"喂超长文档"。 |
+| 自动删会话（`auto_delete_conversation`） | 默认关。开启后每次出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录账号里堆一堆。只登录态生效，异步 best-effort、删失败不影响响应。 |
 | 重试次数 / 重试间隔 / 上游超时 | |
 | 明细保留天数 | 过期只删明细，聚合数据永久保留 |
 | TLS 指纹 | `chrome_146`（默认）/ `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
@@ -393,10 +410,11 @@ Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。�
 ## Cookie（可选）
 
 挂 Google 账号 cookie 后请求走登录态，多出来的能力是 **`gemini-3.1-pro` + 思考链**
-（见上文「思考链」一节）、**读图**、**生图（`gemini-image`）/ 音乐（`gemini-music`）**
-（见上文「生图 / 音乐」一节）。免费账号实测可用，连打 6 次全部回报 `3.1 Pro`。
+（见上文「思考链」一节）、**读图 / 读视频**、**生图（`gemini-image`）/ 音乐（`gemini-music`）
+/ 画布（`gemini-canvas`）/ 生视频（`gemini-video`，要 Pro 号）**。免费账号实测可用，
+连打 6 次全部回报 `3.1 Pro`。
 
-网页端登录后还能用视频、深度研究、画布，**本项目尚未实现这几个**。
+深度研究（多步异步）仍**未实现**。
 
 > 带 cookie 的请求必须额外携带一个 XSRF token，本项目会自动从 Gemini 页面取并按
 > cookie 缓存、过期自动重取，无需配置。（这一步缺了会导致**所有**请求 400，
@@ -525,7 +543,7 @@ Chrome 指纹得有别的理由（比如担心长期账号画像），不能指�
 | `GET /` | ✅ | 健康检查，不鉴权，返回 status/version/models |
 | `/v1beta/models/…`（Gemini CLI 原生格式） | ❌ | 未实现，只暴露 OpenAI 形状的接口 |
 | `/v1/embeddings`、`/v1/images/*`、`/v1/audio/*` | ❌ | 未实现，返回 404 |
-| Function calling | ⚠️ | Prompt 级实现（让模型输出 ` ```tool_call``` ` 块再 regex 解析），不是真协议层。**查私有数据/内部系统类可靠**，但 Gemini 自己能做的（如查天气）会被它直接回答，有副作用的动作（如发邮件）会被拒绝 |
+| Function calling | ⚠️ | Prompt 级实现（让模型输出 ` ```tool_call``` ` 块再 regex 解析），不是真协议层。**查私有数据/内部系统类可靠**，但 Gemini 自己能做的（如查天气）会被它直接回答，有副作用的动作（如发邮件）会被拒绝。**agentic 客户端（Codex 等）已可用**：4.11.0 前它们几十 KB 的系统提示会把工具指令冲没导致「已读乱回」，现已修复；4.12.0 起工具结果压成清爽成功/失败信号，弱模型不再因「命令无输出」误判失败而反复重试（实测同一任务从 26 轮循环降到 2-4 轮收尾）|
 | `tool_choice` | ⚠️ | `none` 完全不注入工具定义；`required` 和指定函数会加强制措辞、并把其余工具从 prompt 裁掉。但 prompt 级实现**无法真正强制**——实测模型自己答得上来的问题（天气、2+2）即使 `required` 也照样直接作答 |
 | `stream_options.include_usage` | ✅ | 在 `finish_reason` 之后补一个 `choices` 为空的 usage chunk |
 | `usage` token 数 | ✅ | tiktoken cl100k_base，与管理面板 requests 表同口径 |
@@ -574,9 +592,9 @@ docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
 ## 限制
 
 - **单 IP 上限**：突发地打，实测 **80-180 次请求**后被重定向到 sorry 页（连接复用能多打约 60%：并发 10 时复用 172/177、每次新建 106/109）。但**平缓打几乎打不满**——静态 IP 上 10 次/分钟连打 800 次没被拦。默认 `per_ip_rph=80` 取的是区间下沿 → 要放大产能配代理池，或按低速率跑并调高限额
-- **登录态功能**：生图（`gemini-image`）、音乐（`gemini-music`）已实现；视频、深度研究、画布没实现（视频免费号被拒，深度研究是多步异步流程）
+- **登录态功能**：生图（`gemini-image`）、音乐（`gemini-music`）、画布（`gemini-canvas`）已实现；视频、深度研究没实现（视频免费号被 Google 收走，深度研究是多步异步流程）
 - **Function calling**：prompt 级实现，模型不一定每次都按格式返回（OpenAI 真协议层我们做不到）
-- **多模态**：读图要挂 cookie；生图/音乐挂 cookie 可用（`gemini-image` / `gemini-music`），视频生成尚未实现
+- **多模态**：读图/读视频要挂 cookie；生图/音乐/画布/生视频挂 cookie 可用，其中生视频还要 Pro/付费号
 - **长上下文有两堵墙**：请求体约 13 万字节、附件约 16 万字节（后者是模型能看到的内容**总量**，切成多份附件不涨额度）。挂 cookie 只能把可用长度从 13 万提到约 16 万，真正的长对话仍需客户端自己压缩
 - **token 数**：用 tiktoken 估算（Gemini 真 tokenizer 未公开），跟真值偏差 ±20% 以内
 - **Cookie 池不自动摘除坏号**：请求成败会回写（只把 401/403 算作 cookie 的错，网络错误和 302 拦截不算），但失败到一定次数不会自动禁用，得看面板手动停。另外 `last_ok_at` 只说明"这个 cookie 参与的请求成功过"，不等于它仍然有效——cookie 过期后 Gemini 不报错，只是把你当匿名用户，纯文本请求照样 200

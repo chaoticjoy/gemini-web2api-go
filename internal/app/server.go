@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const Version = "4.4.0"
+const Version = "4.15.0"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -114,6 +114,13 @@ func rejectUnsupported(req map[string]interface{}, messages []map[string]interfa
 						"uploads succeed but referencing them in a conversation is rejected " +
 						"upstream. Add a cookie in the admin panel (Cookie pool)")
 				}
+			case "video_url", "input_video":
+				// 视频跟图片同理：登录态才能引用，匿名一引用就 1100。
+				if !hasCookie() {
+					return fmt.Errorf("video input needs a Google account cookie: anonymous " +
+						"uploads succeed but referencing them in a conversation is rejected " +
+						"upstream. Add a cookie in the admin panel (Cookie pool)")
+				}
 			case "input_audio":
 				return fmt.Errorf("audio input not supported")
 			}
@@ -130,9 +137,22 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 		return "", nil, res, err
 	}
 	text := extractResponseText(res.Raw)
+	// 画布：HTML 文档内联在响应里（不像图/乐要下载），从 immersive 结构里抠出来。
+	// 标准文本提取只拿到 preamble（"I will generate…"），文档在 inner[4][0][30]…，
+	// 用 extractCanvasDoc 单独取。
+	if mc.Tool == toolCanvas {
+		doc := extractCanvasDoc(res.Raw)
+		if doc == "" {
+			return "", nil, res, fmt.Errorf("canvas generation failed: no HTML document in response (raw %d bytes)", len(res.Raw))
+		}
+		if text != "" && !strings.Contains(doc, text) {
+			return text + "\n\n" + doc, nil, res, nil // preamble + 文档
+		}
+		return doc, nil, res, nil
+	}
 	// 媒体模型（生图/音乐）：生成 200 了但产物字节没取回来，直接报错而不是返回一个
 	// 只有文字没有图的半成品 —— 客户端要的就是那张图/那段乐。
-	if mc.Tool == toolImage || mc.Tool == toolMusic {
+	if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
 		if len(res.Artifacts) == 0 {
 			msg := res.MediaErr
 			if msg == "" {
@@ -140,7 +160,7 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 			}
 			return "", nil, res, fmt.Errorf("media generation succeeded but artifact retrieval failed: %s", msg)
 		}
-		// 产物以 base64 data URL 追加到正文（可能没正文，只有图）。
+		// 产物以 base64 data URL 追加到正文（可能没正文，只有图/乐/视频）。
 		text = appendArtifactMarkdown(text, res.Artifacts)
 		return text, nil, res, nil
 	}
@@ -300,7 +320,15 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	text, toolCalls, res, err := callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
+	var text string
+	var toolCalls []ToolCall
+	var res *StreamResult
+	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
+		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
+	} else {
+		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
+	}
 	if err != nil {
 		recordRequest("chat.completions", modelName, prompt, "", res, 502, err.Error(), stream)
 		if sse != nil && sse.Started() {
@@ -568,6 +596,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	rid := "resp_" + randHex(16)
 	mid := "msg_" + randHex(12)
 
+	// Responses 流式协议要求先 response.output_item.added 声明 item，才能对它发
+	// output_text.delta；漏了 Codex 这类严格客户端会报 "OutputTextDelta without active
+	// item"。msgIndex/nextIdx 给每个 output item 分配序号，ensureMsg 惰性声明 message
+	// item（首个 delta 时才发，纯工具调用轮不发空 message）。
+	msgIndex := -1
+	nextIdx := 0
+	var ensureMsg func()
+
 	// 流式要先把头和 response.created 发出去，才能边收边推 delta。
 	// 代价是一旦开了流 HTTP 状态码就改不了了，上游失败只能用 response.failed
 	// 事件告知 —— 跟 /v1/chat/completions 那条路的取舍一致。
@@ -578,6 +614,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 	if stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no") // 关掉反代对 SSE 的缓冲，见 sse.go
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.WriteHeader(200)
 		flusher, _ := w.(http.Flusher)
@@ -598,10 +635,32 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 				"output": []interface{}{},
 			},
 		})
+		ensureMsg = func() {
+			if msgIndex >= 0 {
+				return
+			}
+			msgIndex = nextIdx
+			nextIdx++
+			writeEvent("response.output_item.added", map[string]interface{}{
+				"type":         "response.output_item.added",
+				"output_index": msgIndex,
+				"item": map[string]interface{}{
+					"id": mid, "type": "message", "role": "assistant",
+					"status": "in_progress", "content": []interface{}{},
+				},
+			})
+			writeEvent("response.content_part.added", map[string]interface{}{
+				"type": "response.content_part.added", "item_id": mid,
+				"output_index": msgIndex, "content_index": 0,
+				"part": map[string]interface{}{"type": "output_text", "text": "", "annotations": []interface{}{}},
+			})
+		}
 		emitDelta = func(d string) {
+			ensureMsg()
 			writeEvent("response.output_text.delta", map[string]interface{}{
 				"type":          "response.output_text.delta",
 				"item_id":       mid,
+				"output_index":  msgIndex,
 				"content_index": 0,
 				"delta":         d,
 			})
@@ -617,7 +676,14 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// onReasoning 传 nil：Responses API 有自己的 reasoning 事件形状，跟 chat 的
 	// reasoning_content 不通用，这条路目前不暴露思考链。
-	text, toolCalls, res, err := callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
+	var text string
+	var toolCalls []ToolCall
+	var res *StreamResult
+	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
+		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, nil)
+	} else {
+		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
+	}
 	if err != nil {
 		recordRequest("responses", modelName, prompt, "", res, 502, err.Error(), stream)
 		if stream {
@@ -687,6 +753,12 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		for _, item := range output {
 			switch item["type"] {
 			case "function_call":
+				// 工具调用 item 也要 added → done 包起来，Codex 才认。
+				idx := nextIdx
+				nextIdx++
+				writeEvent("response.output_item.added", map[string]interface{}{
+					"type": "response.output_item.added", "output_index": idx, "item": item,
+				})
 				writeEvent("response.function_call_arguments.done", map[string]interface{}{
 					"type":      "response.function_call_arguments.done",
 					"item_id":   item["id"],
@@ -694,17 +766,30 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 					"name":      item["name"],
 					"arguments": item["arguments"],
 				})
+				writeEvent("response.output_item.done", map[string]interface{}{
+					"type": "response.output_item.done", "output_index": idx, "item": item,
+				})
 			case "message":
+				ensureMsg() // 没有 delta 但有正文时，这里补声明 message item
 				if cps, ok := item["content"].([]map[string]interface{}); ok {
 					for ci, cp := range cps {
 						writeEvent("response.output_text.done", map[string]interface{}{
 							"type":          "response.output_text.done",
 							"item_id":       item["id"],
+							"output_index":  msgIndex,
 							"content_index": ci,
 							"text":          cp["text"],
 						})
+						writeEvent("response.content_part.done", map[string]interface{}{
+							"type": "response.content_part.done", "item_id": item["id"],
+							"output_index": msgIndex, "content_index": ci,
+							"part": map[string]interface{}{"type": "output_text", "text": cp["text"], "annotations": []interface{}{}},
+						})
 					}
 				}
+				writeEvent("response.output_item.done", map[string]interface{}{
+					"type": "response.output_item.done", "output_index": msgIndex, "item": item,
+				})
 			}
 		}
 		respObj := map[string]interface{}{

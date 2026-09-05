@@ -22,6 +22,12 @@ const (
 	hexFlash36   = "fbb127bbb056c959" // 3.6 Flash
 	hexFlashLite = "cf41b0e0dd7d53e5" // 3.5 Flash-Lite
 	hexPro31     = "9d8ca3786ebdfbea" // 3.1 Pro
+	// 3.7 Flash：按账号灰度放出。hex 是 otAQ7b 里 3.7 条目的**主 hex**（第一个元素），
+	// 两个独立已灰度账号的清单里都是它、且有 3.7 号的用户实测发它回报 "3.7 Flash"
+	// （issue #4 / PR #11）。注意别用 compat 列表里那个 797f3d0293f288ad —— 那是
+	// "当前 Flash" 泛指针，老批次号发它拿到的是 3.6，会冒充 3.7。老批次号发这个主 hex
+	// 会干净降级成 3.5 Flash-Lite（跟 3.1 Pro 一样），所以 gate 成要 cookie。
+	hexFlash37 = "56fdd199312815e2" // 3.7 Flash
 )
 
 // innerSlots 是 payload 里 inner 数组的长度。浏览器发 97-98 槽，我们原来只开 80，
@@ -67,17 +73,23 @@ var Models = map[string]ModelConfig{
 	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Desc: "Latest all-around model"},
 	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Desc: "Fastest, lightweight"},
 	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
+	// 3.7 Flash：灰度放出，要 cookie 且账号得已灰度到 3.7，否则降级成 3.5 Flash-Lite。
+	"gemini-3.7-flash": {HexID: hexFlash37, Mode: 1, Desc: "3.7 Flash (rollout-gated); needs a signed-in cookie on an account that already has 3.7"},
 
-	// 扩展思考版。inner[80]=2 跟模型 hex 正交，三个模型都能开；但只在登录态生效，
+	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
 	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
 	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
+	"gemini-3.7-flash-thinking":      {HexID: hexFlash37, Mode: 1, Thinking: true, Desc: "3.7 Flash with extended thinking; needs a signed-in cookie on an account that has 3.7"},
 
 	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
 	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
 	"gemini-image": {HexID: hexFlash36, Mode: 1, Tool: toolImage, Desc: "Image generation (Nano Banana); returns a base64 data URL; needs a signed-in cookie"},
 	"gemini-music": {HexID: hexFlash36, Mode: 1, Tool: toolMusic, Desc: "Music generation (Lyria, ~30s); returns a base64 data URL; needs a signed-in cookie"},
+	"gemini-video": {HexID: hexFlash36, Mode: 1, Tool: toolVideo, Desc: "Video generation (Veo, async); returns a base64 data URL; needs a signed-in cookie (usually a paid account)"},
+	// 画布：生成 immersive 交互 HTML 文档，内联返回（不是二进制、不用下载）。要登录态。
+	"gemini-canvas": {HexID: hexFlash36, Mode: 1, Tool: toolCanvas, Desc: "Canvas: generates an interactive HTML document (returned inline as a ```html block); needs a signed-in cookie"},
 }
 
 // hasCookie 表示 cookie 池里有没有可用账号。决定 3.1 Pro 是否出现在模型列表里。
@@ -101,7 +113,7 @@ func availableModels() map[string]ModelConfig {
 	}
 	out := make(map[string]ModelConfig, len(Models))
 	for k, v := range Models {
-		if k == "gemini-3.1-pro" || v.Thinking || v.Tool > 0 {
+		if k == "gemini-3.1-pro" || k == "gemini-3.7-flash" || v.Thinking || v.Tool > 0 {
 			continue
 		}
 		out[k] = v
@@ -379,7 +391,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
 	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
 	proxyURL := picked.URL
-	pickedOK := picked.ID > 0 // 是否真用了代理池里的代理
+	pickedOK := picked.ID != 0 // 是否真用了代理池里的代理（包含动态代理 ID<0 和本地代理 ID>0）
 
 	// endpoint 要等出口定下来才能拼：currentBL 可能顺手踢一次后台抓取，
 	// 那个抓取必须跟正式请求走同一个出口，否则配了代理池也会从本机 IP 漏一次。
@@ -464,14 +476,20 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				"anonymous uploads succeed but referencing them in a conversation is " +
 				"rejected upstream. Add a cookie in the admin panel (Cookie pool)"))
 		}
+		nImg, nVid := 0, 0
 		for _, u := range pending {
 			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
 			if uerr != nil {
-				return attrib(fmt.Errorf("上传图片 %s 失败: %w", u.Name, uerr))
+				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
 			}
 			files = append(files, fileRef{Ref: ref, Name: u.Name, Kind: u.Kind, Mime: u.Mime})
+			if u.Kind == 2 {
+				nVid++
+			} else {
+				nImg++
+			}
 		}
-		logf("[vision] 上传了 %d 张图", len(pending))
+		logf("[vision] 上传了 %d 张图 / %d 个视频", nImg, nVid)
 	}
 
 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
@@ -544,6 +562,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// 媒体工具开关。填了服务端就换后端模型出图/出乐（响应里带产物引用，字节要另取）。
 	if mc.Tool > 0 {
 		inner[49] = mc.Tool
+	}
+	// 视频还要在 inner[55] 指定画幅比例：[[16]]=16:9，[[17]]=9:16（抓包）。
+	if mc.Tool == toolVideo {
+		inner[55] = []interface{}{[]interface{}{16}}
 	}
 
 	innerJSON, err := json.Marshal(inner)
@@ -683,7 +705,6 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		if pickedOK {
 			recordProxyResult(picked.ID, true, "")
 		}
-		releaseSlot(picked.ID)
 		markCookieByStatus(cookieID, 200, "")
 		result := &StreamResult{
 			Emitted:          tracker.emitted,
@@ -700,10 +721,13 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
 		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。
-		if mc.Tool == toolImage || mc.Tool == toolMusic {
+		if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
 			mime := "image/png"
-			if mc.Tool == toolMusic {
+			switch mc.Tool {
+			case toolMusic:
 				mime = "audio/mpeg"
+			case toolVideo:
+				mime = "video/mp4"
 			}
 			arts, aerr := fetchMediaArtifacts(
 				mc.Tool, string(raw), extractConversationID(string(raw)),
@@ -714,6 +738,13 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			} else {
 				result.Artifacts = arts
 				logf("[media] 取回 %d 份产物", len(arts))
+			}
+		}
+		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
+		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
+		if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
+			if cid := extractConversationID(string(raw)); cid != "" {
+				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
 			}
 		}
 		return result, nil
@@ -1004,13 +1035,24 @@ func extractResponseText(raw string) string {
 	}
 	for i := len(texts) - 1; i >= 0; i-- {
 		if strings.TrimSpace(texts[i]) != "" {
-			return cleanGeminiText(texts[i])
+			cleaned := cleanGeminiText(texts[i])
+			if cleaned == "" {
+				// 整条回复都是代码执行产物（问数学/算式时模型直接跑代码），清洗后被剥空。
+				// 别返回空——那样 callGemini 会当"无内容帧"报 502，用户看到的是调用失败。
+				// 回退：只把 ?code_reference/stdout 标记去掉、保留代码和结果，当普通代码块给。
+				cleaned = strings.TrimSpace(codeMarkerRe.ReplaceAllString(texts[i], "```$1"))
+			}
+			return cleaned
 		}
 	}
 	return ""
 }
 
 var codeArtifactRe = regexp.MustCompile("(?s)```(?:python|javascript|text)\\?code_(?:reference|stdout)&code_event_index=\\d+\\n.*?```\\n?")
+
+// codeMarkerRe 只匹配代码产物的**开围栏标记**（```python?code_reference&code_event_index=N），
+// 用于清洗后为空时的回退：把标记降级成普通 ```python，保留代码/结果不整条清空。
+var codeMarkerRe = regexp.MustCompile("```(python|javascript|text)\\?code_(?:reference|stdout)&code_event_index=\\d+")
 
 func cleanGeminiText(text string) string {
 	return strings.TrimSpace(codeArtifactRe.ReplaceAllString(text, ""))

@@ -17,9 +17,62 @@ import (
 
 // inner[49] 媒体工具开关：填了服务端就换后端模型生成产物。
 const (
-	toolImage = 14 // 生图 → Nano Banana
-	toolMusic = 21 // 音乐 → Lyria（约 30 秒）
+	toolImage  = 14 // 生图 → Nano Banana
+	toolMusic  = 21 // 音乐 → Lyria（约 30 秒）
+	toolCanvas = 2  // 画布 → immersive HTML 文档（内联在响应里，不用另下载）
+	toolVideo  = 11 // 视频 → Veo（异步：提交后 MUAZcd 轮询到完成，再 hNvQHb 拿下载链）
 )
+
+// extractCanvasDoc 从 canvas（inner[49]=2）响应里抠出生成的 HTML 文档。
+//
+// 跟图/乐不同：文档不用另外下载，直接内联在帧里——immersive 结构
+// （inner[4][0][30]… 那条）里有个形如 "```html\n<!DOCTYPE html>…```" 的字符串。
+// 流式时同一份文档在多帧里累积重发，取所有帧里含 DOCTYPE 的**最长**字符串 = 最终完整版。
+func extractCanvasDoc(raw string) string {
+	best := ""
+	var walk func(interface{})
+	walk = func(o interface{}) {
+		switch v := o.(type) {
+		case string:
+			if len(v) > len(best) && strings.Contains(v, "DOCTYPE") {
+				best = v
+			}
+		case []interface{}:
+			for _, x := range v {
+				walk(x)
+			}
+		case map[string]interface{}:
+			for _, x := range v {
+				walk(x)
+			}
+		}
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[[") {
+			continue
+		}
+		var arr []interface{}
+		if json.Unmarshal([]byte(line), &arr) != nil {
+			continue
+		}
+		for _, it := range arr {
+			row, ok := it.([]interface{})
+			if !ok || len(row) < 3 {
+				continue
+			}
+			payload, ok := row[2].(string)
+			if !ok {
+				continue
+			}
+			var inner interface{}
+			if json.Unmarshal([]byte(payload), &inner) == nil {
+				walk(inner)
+			}
+		}
+	}
+	return best
+}
 
 // downloadOPI 是产物下载 URL（contribution 那条）必带的 opi 参数。取自 /app 页面，
 // 实测两个独立账号都是这个值，当全局常量用。图片走 lh3 CDN 那条不需要它。
@@ -78,7 +131,27 @@ func fetchMediaArtifacts(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, de
 	if tool == toolImage {
 		return fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
 	}
-	return fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
+	// 音乐几乎立刻就绪，视频要生成几十秒到几分钟，所以视频轮询给足预算。
+	maxPolls, interval := 6, 2*time.Second
+	if tool == toolVideo {
+		maxPolls, interval = 45, 8*time.Second // 约 6 分钟
+	}
+	arts, err := fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime, maxPolls, interval)
+	if err != nil {
+		return arts, err
+	}
+	// 视频一次请求 hNvQHb 里会挂多份下载链（疑似 Veo 的多候选/多档编码，含义未严谨证明），
+	// 只留最大的那份，免得客户端一次拿到两个视频。要区分含义得有干净出口再验（见 CLAUDE.md）。
+	if tool == toolVideo && len(arts) > 1 {
+		largest := arts[0]
+		for _, a := range arts[1:] {
+			if len(a.Data) > len(largest.Data) {
+				largest = a
+			}
+		}
+		arts = []MediaArtifact{largest}
+	}
+	return arts, nil
 }
 
 // fetchImageArtifacts 取回生成的图片。链在 StreamGenerate 响应里就有，抠不到再退回轮询
@@ -101,7 +174,7 @@ func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime 
 	}
 	var arts []MediaArtifact
 	for _, u := range urls {
-		mime, data, err := downloadBytes(u, cookie, proxyURL, defaultMime)
+		mime, data, err := downloadBytes(imageFullResURL(u), cookie, proxyURL, defaultMime)
 		if err != nil {
 			return arts, err
 		}
@@ -114,21 +187,45 @@ func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime 
 	return arts, nil
 }
 
+// imageFullResURL 给图片 CDN 链加尺寸参数取原图。plain gg-dl 默认下来是 ~500px 的缩略图
+// （issue #14：控制台里是 1365×768，链尾 =s1024-rj 改 =s2048-rj 更大）。googleusercontent
+// 惯例是在链尾加 =sN 指定最大边、=s0 取原始尺寸。这里用 =s0 取全分辨率、且不改格式
+// （-rj 会强制 jpeg，我们要保持 PNG）。
+//
+// 选项在最后一个路径段里、以 = 分隔；gg-dl token 是 base64url 不含 =，所以按最后一个
+// 路径段里的 = 切，去掉已有选项再加 =s0。
+func imageFullResURL(u string) string {
+	i := strings.LastIndexByte(u, '/')
+	if i < 0 {
+		return u + "=s0"
+	}
+	seg := u[i+1:]
+	if j := strings.IndexByte(seg, '='); j >= 0 {
+		u = u[:i+1] + seg[:j]
+	}
+	return u + "=s0"
+}
+
 // fetchDownloadArtifacts 取回音乐/视频：轮询 hNvQHb 等到 response_data 下载链，再下。
 // gg-dl（lh3）和 temp_data 那两种链是预览用的，只有 response_data 那条能下到真字节。
-func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, error) {
+func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime string,
+	maxPolls int, interval time.Duration) ([]MediaArtifact, error) {
 	if cid == "" {
 		return nil, fmt.Errorf("没拿到会话 id，无法定位产物")
 	}
 	var dlURLs []string
-	for i := 0; i < 6; i++ {
+	for i := 0; i < maxPolls; i++ {
 		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err == nil {
 			if picked := pickResponseDataURLs(collectDownloadURLs(body)); len(picked) > 0 {
 				dlURLs = picked
 				break
 			}
+			// 视频被内容政策拒时 hNvQHb 里是「I can't generate that video」，别干等到超时。
+			if strings.Contains(body, "can't generate that video") {
+				return nil, fmt.Errorf("视频被内容政策拒绝（换个 prompt 再试）")
+			}
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(interval)
 	}
 	if len(dlURLs) == 0 {
 		return nil, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
@@ -180,6 +277,36 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error)
 		return "", fmt.Errorf("hNvQHb HTTP %d", status)
 	}
 	return string(body), nil
+}
+
+// deleteConversation 删掉 gemini.google.com 上留下的一条会话（#19）。
+//
+// 协议逐字取自抓包：rpc GzXR5e，参数 ["<cid>"]，mode "generic"，带 at=XSRF。
+//   f.req=[[["GzXR5e","[\"c_xxx\"]",null,"generic"]]]&at=<xsrf>
+// 只登录态可用（匿名没有 XSRF、会话也没落到账号里）。best-effort：删失败只记日志，
+// 不影响已经返给客户端的响应。
+func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string) {
+	inner, _ := json.Marshal([]interface{}{cid})
+	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"GzXR5e", string(inner), nil, "generic"}}})
+	form := url.Values{}
+	form.Set("f.req", string(freq))
+	form.Set("at", xsrf)
+	reqid := time.Now().UnixNano() % 1000000
+	endpoint := fmt.Sprintf(
+		"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=GzXR5e&bl=%s&hl=en&_reqid=%d&rt=c",
+		currentBL(proxyURL), reqid)
+	headers := buildGeminiHeaders(cookie, sapisid, "")
+	delete(headers, "x-goog-ext-525001261-jspb")
+	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
+	if err != nil {
+		logf("[autodel] 删会话 %s 失败: %v", cid, err)
+		return
+	}
+	if status != 200 {
+		logf("[autodel] 删会话 %s 返回 HTTP %d: %s", cid, status, truncate(string(body), 120))
+		return
+	}
+	logf("[autodel] 已删会话 %s", cid)
 }
 
 // walkFramesForURLs 递归遍历 batchexecute 信封里所有字符串，返回 want 命中的那些（去重保序）。
