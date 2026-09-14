@@ -47,6 +47,9 @@ type Config struct {
 	// 出完结果是否自动删掉 gemini.google.com 上留下的这条会话（#19，rpc GzXR5e）。
 	// 只登录态生效（删除要 XSRF）；异步 best-effort，删失败只记日志不影响响应。默认 false。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
+	// 匿名优先（#20）：这次请求不需要登录态能力（纯文本、非思考、无工具、无图）时
+	// 不占用 cookie 账号，走匿名省额度；需要登录才挑号。默认 false。见 modelNeedsLogin。
+	AnonFirst bool `json:"anon_first"`
 }
 
 var (
@@ -90,6 +93,7 @@ func defaultConfig() Config {
 		MaxPromptBytes:         128000,
 		MultiTurn:              false,
 		AutoDeleteConversation: false,
+		AnonFirst:              false,
 	}
 }
 

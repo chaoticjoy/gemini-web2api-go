@@ -14,6 +14,11 @@ import (
 // 也避免把凭证放进一个网页表单。这里只放调优参数——为了改个超时重启一次服务太蠢。
 //
 // 取值优先级：面板改过的（存 kv 表） > config.json / CLI flag > 内置默认。
+//
+// 加字段必读：面板保存走整体反序列化（admin.go 的 Decode(&RuntimeConfig)），而前端
+// saveRtCfg 只按 admin_ui 的 RT_GROUPS 拼 PUT body。新加的字段必须同步进 RT_GROUPS，
+// 否则它不在 body 里、每次点「保存并生效」都被解成零值冲掉（multi_turn 就这么被静默
+// 重置过，连 config.json 里设的都白设，见 #27）。
 type RuntimeConfig struct {
 	RetryAttempts   int    `json:"retry_attempts"`
 	RetryDelaySec   int    `json:"retry_delay_sec"`
@@ -53,6 +58,9 @@ type RuntimeConfig struct {
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果自动删掉 gemini.google.com 上的这条会话（#19）。只登录态生效。默认 false。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
+	// 匿名优先（#20）：不需要登录态能力的请求（纯文本、非思考、无工具、无图）走匿名、
+	// 不占 cookie 账号，省账号额度；需要登录才挑号。默认 false，见 modelNeedsLogin。
+	AnonFirst bool `json:"anon_first"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -90,6 +98,7 @@ func initRuntimeConfig() {
 		MultiTurn:        cfg.MultiTurn,
 
 		AutoDeleteConversation: cfg.AutoDeleteConversation,
+		AnonFirst:              cfg.AnonFirst,
 	}
 	if base.ProxyMode == "" {
 		base.ProxyMode = "auto"

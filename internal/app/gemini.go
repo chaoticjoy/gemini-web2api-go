@@ -27,7 +27,7 @@ const (
 	// （issue #4 / PR #11）。注意别用 compat 列表里那个 797f3d0293f288ad —— 那是
 	// "当前 Flash" 泛指针，老批次号发它拿到的是 3.6，会冒充 3.7。老批次号发这个主 hex
 	// 会干净降级成 3.5 Flash-Lite（跟 3.1 Pro 一样），所以 gate 成要 cookie。
-	hexFlash37 = "56fdd199312815e2" // 3.7 Flash
+	hexFlash38 = "56fdd199312815e2" // 3.8 Flash（原记 3.7；Google 把这个 hex 原地升成 3.8，HAR 响应帧显示名已是 "3.8 Flash"）
 )
 
 // innerSlots 是 payload 里 inner 数组的长度。浏览器发 97-98 槽，我们原来只开 80，
@@ -73,15 +73,19 @@ var Models = map[string]ModelConfig{
 	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Desc: "Latest all-around model"},
 	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Desc: "Fastest, lightweight"},
 	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
-	// 3.7 Flash：灰度放出，要 cookie 且账号得已灰度到 3.7，否则降级成 3.5 Flash-Lite。
-	"gemini-3.7-flash": {HexID: hexFlash37, Mode: 1, Desc: "3.7 Flash (rollout-gated); needs a signed-in cookie on an account that already has 3.7"},
+	// 3.8 Flash：Google 把原 3.7 那个 hex 原地升级了（同 hex，服务端显示名从 3.7 变 3.8）。
+	// 实测是**付费号专属**（不是灰度）：只有付费 Gemini 账号有，免费号降级成 3.5 Flash-Lite。
+	// gemini-3.7-flash 保留为别名（同 hex）。
+	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
+	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
 	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
 	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
-	"gemini-3.7-flash-thinking":      {HexID: hexFlash37, Mode: 1, Thinking: true, Desc: "3.7 Flash with extended thinking; needs a signed-in cookie on an account that has 3.7"},
+	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Desc: "alias of gemini-3.8-flash-thinking"},
 
 	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
 	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
@@ -96,6 +100,26 @@ var Models = map[string]ModelConfig{
 func hasCookie() bool {
 	_, enabled := accountCount()
 	return enabled > 0
+}
+
+// modelNeedsLogin 判断一个模型是否必须登录态才真正生效。匿名请求这批会被服务端
+// 静默降级：3.1 Pro / 3.8 Flash → 3.5 Flash-Lite；思考链消失；媒体工具变成一句
+// "Are you signed in?" 文本。是「没 cookie 时排除哪些模型」和「#20 匿名优先要不要
+// 占一个 cookie 账号」共用的单一判据。
+//
+// 按 HexID + Thinking + Tool 判，跟旧的按模型名（3.1-pro/3.8-flash/3.7-flash）判
+// 逐模型核对等价：那三个正名的 HexID 就是 hexPro31 / hexFlash38，其余登录模型都被
+// Thinking 或 Tool 覆盖。
+func modelNeedsLogin(mc ModelConfig) bool {
+	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.Thinking || mc.Tool > 0
+}
+
+// anonFirstEligible 判断「匿名优先」开关下这次请求能不能走匿名（不占 cookie 账号）：
+// 开关开着 + 没带附件 + 模型不需要登录态。附件（图/视频）在对话里引用必须登录
+// （匿名会被上游回 1100），所以带附件时一律挑号。开关关着永远返回 false（保持旧行为：
+// 池里有号就用号）。
+func anonFirstEligible(mc ModelConfig, hasAttachment bool) bool {
+	return rtCfg().AnonFirst && !hasAttachment && !modelNeedsLogin(mc)
 }
 
 // availableModels 返回当前配置下值得暴露的模型。
@@ -113,7 +137,7 @@ func availableModels() map[string]ModelConfig {
 	}
 	out := make(map[string]ModelConfig, len(Models))
 	for k, v := range Models {
-		if k == "gemini-3.1-pro" || k == "gemini-3.7-flash" || v.Thinking || v.Tool > 0 {
+		if modelNeedsLogin(v) {
 			continue
 		}
 		out[k] = v
@@ -359,9 +383,13 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	//
 	// 挑号排在 acquireSlot 之前不违反「取 XSRF 必须走正式出口」：挑号只读库、
 	// 不发请求，真正发请求的是下面的 getXSRF，它在拿到 slot 之后。
+	// #20 匿名优先：不需要登录态能力时不占用 cookie 账号，走匿名省额度（见 anonFirstEligible）。
+	// 带附件（图/视频）时不能走匿名——下面 uploadBytes 那段会因 cookieStr=="" 直接报错。
 	var acct *CookieAccount
-	if a, ok := pickCookieAccount(); ok {
-		acct = a
+	if !anonFirstEligible(mc, len(pending) > 0) {
+		if a, ok := pickCookieAccount(); ok {
+			acct = a
+		}
 	}
 	preferProxy := int64(0)
 	if acct != nil {
@@ -432,12 +460,12 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		// 取不到 SNlM0e 基本等于这个 cookie 已失效（页面把我们当匿名用户了）。
 		// 换号之前先给它一次机会：强制轮转一次再重取。
 		//
-		// 轮转会把上游刷新的 *SIDCC 合并回来，而 cookie 就是因为一直发旧值才被判成
-		// 过期会话的 —— 陈旧到这一步还能救回来的号，直接换掉等于白白丢一个。
-		// 只试一次，且只在这一轮：救不回来说明不是陈旧问题。
+		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
+		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
+		// 只试一次，且只在这一轮。
 		if !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
-			if _, rerr := rotateAccount(*acct); rerr == nil {
+			if _, _, rerr := rotateAccount(*acct); rerr == nil {
 				if fresh := accountByID(acct.ID); fresh != nil {
 					if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
 						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)

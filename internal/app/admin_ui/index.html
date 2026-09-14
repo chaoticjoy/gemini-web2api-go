@@ -166,6 +166,7 @@
        vertical-align: top; overflow-wrap: anywhere; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover { background: #F6F9FE; }
+  tbody tr.row-dead { background: var(--fail-bg); box-shadow: inset 3px 0 0 var(--fail); }
   td.nw, th.nw { white-space: nowrap; overflow-wrap: normal; }
   td.num { font-variant-numeric: tabular-nums; }
   .empty { text-align: center; color: var(--muted); padding: 36px 0; }
@@ -643,10 +644,12 @@ const pages = {
   cookies: async () => {
     const data = await api('api/cookies');
     const items = data.items || [];
+    const deadN = items.filter(a => a.health === 'dead').length;
     return `
       <div class="panel page-fill">
         <h2>Cookie 池
           <span class="controls">
+            ${deadN > 0 ? '<span class="badge fail" style="margin-right:8px" title="这些号鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">' + deadN + ' 疑似失效</span>' : ''}
             <span class="badge ${data.enabled > 0 ? 'ok' : 'muted'}" style="margin-right:8px">${data.enabled || 0} 启用 / ${data.total || 0} 共</span>
             <button class="btn" onclick="addCookieAcct()">+ 导入 Cookie</button>
           </span>
@@ -655,11 +658,12 @@ const pages = {
           <summary>每行一个 Google 登录态账号</summary>
           <div class="body">
             粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID /
-            APISID / SAPISID / __Secure-1PSID）。请求时按<b>最久未用优先</b>自动轮转挑一个
+            APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个
             启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
             凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 /
-            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号无法长期续命，
-            会标黄提示。
+            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄，
+            首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出
+            （Chrome 新版本的设备绑定会话续不了）。
           </div>
         </details>
         <div class="table-scroll">
@@ -675,13 +679,18 @@ const pages = {
               <th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
             </tr></thead>
             <tbody>${items.map(a => `
-              <tr>
+              <tr class="${a.health === 'dead' ? 'row-dead' : ''}">
                 <td class="num nw">${a.id}</td>
                 <td class="truncate" title="${escapeHtml(a.label || '')}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}</td>
-                <td class="nw">${a.status === 'enabled' ? '<span class="badge ok">启用</span>' : '<span class="badge muted">禁用</span>'}</td>
+                <td class="nw">${
+                  a.health === 'dead' ? '<span class="badge fail" title="鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">疑似失效</span>'
+                  : a.health === 'disabled' ? '<span class="badge muted">禁用</span>'
+                  : a.health === 'unknown' ? '<span class="badge warn" title="还没成功用过，点「检测」确认">待检测</span>'
+                  : '<span class="badge ok">正常</span>'
+                }</td>
                 <td class="nw" title="共 ${a.cookie_count} 个 cookie，关键项：${(a.key_cookies||[]).join(' / ')}">
                   <span class="badge ${a.has_1psidts ? 'ok' : 'warn'}">${(a.key_cookies||[]).length}/7 项</span>
-                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，无法长期续命">缺 TS</span>'}
+                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出">缺 TS</span>'}
                 </td>
                 <td class="pre nw">${a.sapisid_tail ? '…' + escapeHtml(a.sapisid_tail) : '—'}</td>
                 <td class="num nw">${a.fail_count > 0 ? '<span class="badge fail">' + a.fail_count + '</span>' : 0}</td>
@@ -903,6 +912,8 @@ async function loadReqs() {
 // ── 运行时配置 ───────────────────────────────────────────────────────────────
 // 字段定义跟后端 RuntimeConfig 一一对应；范围与后端 validateRuntimeConfig 一致，
 // 前端只做提示，真正的校验在后端（浏览器里的限制随便绕）。
+// 必须一一对应：saveRtCfg 只按这里的字段拼 PUT body，后端整体反序列化，漏在这里
+// 列出的 RuntimeConfig 字段每次保存都会被解成零值冲掉（multi_turn 栽过，见 #27）。
 // 按语义分组，组内自适应多列。分组的依据是"改这一项时在想什么"：
 // 调产能 / 调容错 / 调怎么发请求 / 调留多少数据，而不是按字段类型堆在一起。
 const RT_GROUPS = [
@@ -941,6 +952,10 @@ const RT_GROUPS = [
         hint: '每 6 小时从 /app 页面抓一次最新版本号，抓到就用抓到的。抓不到或格式不对就继续用上面钉的值' },
       { k: 'auto_delete_conversation', label: '自动删网页会话', type: 'bool',
         hint: '出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录号里堆一堆。只登录态生效，异步 best-effort，删失败不影响响应' },
+      { k: 'multi_turn', label: '服务端多轮续接', type: 'bool',
+        hint: '走 Gemini 原生服务端多轮：按历史前缀认出这是上一轮的续接，命中就只发最新一句、历史留在服务端，同一串对话复用同一个 gemini 会话（不再每发一条就新开一个）。匿名/登录都行，带图或带工具时不生效。首轮/重启/改历史会退回整段重发。默认关' },
+      { k: 'anon_first', label: '匿名优先', type: 'bool',
+        hint: '这次请求不需要登录态能力时（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号（默认关）' },
       { k: 'proxy_mode', label: '代理调度模式', type: 'select',
         options: [
           { v: 'auto', l: '自动混合模式（静态代理 → 动态代理 → 无配置退回直连）' },
@@ -1169,7 +1184,7 @@ async function testProxyPool() {
 const COOKIE_KEYS = [
   { k: '__Secure-1PSID', hint: '主会话' },
   { k: 'SAPISID', req: true, hint: '算授权头用，缺了会被当匿名' },
-  { k: '__Secure-1PSIDTS', hint: '会话时间戳，随会话刷新而变' },
+  { k: '__Secure-1PSIDTS', hint: '约 30 分钟过期，保活会自动换发' },
   { k: 'SID' }, { k: 'HSID' }, { k: 'SSID' }, { k: 'APISID' },
 ];
 
@@ -1230,8 +1245,9 @@ async function addCookieAcct() {
       <div data-pane="raw">
         <div class="field">
           <textarea data-name="cookie" rows="6" spellcheck="false"
-            placeholder="SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=..."></textarea>
-          <div class="hint">整行粘贴，分号分隔。至少要含 SAPISID。DevTools 里全选复制即可，
+            placeholder="SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...; __Secure-1PSIDTS=..."></textarea>
+          <div class="hint">整行粘贴，分号分隔。至少要含 SAPISID 和 __Secure-1PSID。
+          建议用 Firefox 导出（Chrome 新版本的会话绑在设备上，续不了）。DevTools 里全选复制即可，
           多余的项会一并保留 —— 发得越全越像真实浏览器。</div>
         </div>
       </div>
@@ -1350,7 +1366,7 @@ async function checkCookieAcct(id, btn) {
   }
 }
 
-// 手动触发一次会话保活。后台每 10 分钟自动跑一次，这个按钮用来当场验证。
+// 手动触发一次会话保活（刷新 1PSIDTS + SIDCC）。后台启动 15 秒后跑第一次，之后每 10 分钟。
 async function rotateCookieAcct(id, btn) {
   const old = btn.textContent;
   btn.textContent = '…'; btn.disabled = true;
@@ -1920,7 +1936,8 @@ const I18N_EN = {
   '最近成功': 'Last success',
   '未命名': 'Unnamed',
   '缺 TS': 'Missing TS',
-  '缺 __Secure-1PSIDTS，无法长期续命': 'Missing __Secure-1PSIDTS; cannot be kept alive long-term',
+  '缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出': 'Missing __Secure-1PSIDTS; first keepalive will try to mint one. If that fails, re-export from Firefox',
+  '约 30 分钟过期，保活会自动换发': 'Expires in ~30 minutes; keepalive rotates it automatically',
   '检测': 'Check',
   '保活': 'Keep-alive',
   '编辑': 'Edit',
@@ -2003,8 +2020,8 @@ const I18N_EN = {
   '仅用于面板里区分账号，不参与请求。': 'Only used to tell accounts apart in the panel; not sent with requests.',
   '整串粘贴（推荐）': 'Paste full string (recommended)',
   '逐项填写': 'Fill in individually',
-  '整行粘贴，分号分隔。至少要含 SAPISID。DevTools 里全选复制即可，多余的项会一并保留 —— 发得越全越像真实浏览器。':
-    'Paste the whole line, semicolon-separated. Must contain at least SAPISID. Select-all and copy in DevTools; extra items are kept too — the more complete, the more it looks like a real browser.',
+  '整行粘贴，分号分隔。至少要含 SAPISID 和 __Secure-1PSID。 建议用 Firefox 导出（Chrome 新版本的会话绑在设备上，续不了）。DevTools 里全选复制即可， 多余的项会一并保留 —— 发得越全越像真实浏览器。':
+    'Paste the whole line, semicolon-separated. Must contain at least SAPISID and __Secure-1PSID. Prefer Firefox (recent Chrome binds the session to the device and it will not renew). Select-all and copy in DevTools; extra items are kept too — the more complete, the more it looks like a real browser.',
   '备注': 'Note',
   'Cookie 不能为空': 'Cookie cannot be empty',
   'cookie 里没有 SAPISID，多半没复制全': 'No SAPISID in the cookie — you probably did not copy it all',
@@ -2049,6 +2066,10 @@ const I18N_EN = {
   '自建动态代理池 REST API 服务地址，如 http://127.0.0.1:8888 (格式参考 proxy.md)': 'Self-hosted dynamic proxy pool REST API URL, e.g. http://127.0.0.1:8888 (see proxy.md)',
   '自动删网页会话': 'Auto-delete web conversations',
   '出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录号里堆一堆。只登录态生效，异步 best-effort，删失败不影响响应': 'Auto-delete conversation on gemini.google.com after completion to prevent clutter. Logged-in accounts only, async best-effort.',
+  '服务端多轮续接': 'Server-side Multi-turn',
+  '走 Gemini 原生服务端多轮：按历史前缀认出这是上一轮的续接，命中就只发最新一句、历史留在服务端，同一串对话复用同一个 gemini 会话（不再每发一条就新开一个）。匿名/登录都行，带图或带工具时不生效。首轮/重启/改历史会退回整段重发。默认关': 'Use native Gemini server-side multi-turn: reuse server-side session for conversation continuations. Default off.',
+  '匿名优先': 'Anonymous First',
+  '这次请求不需要登录态能力时（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号（默认关）': 'Route requests not requiring signed-in features (plain text, non-thinking, no tools, no images) anonymously to save cookie account quota. Default off.',
 };
 let LANG = (() => { try { return localStorage.getItem('lang') === 'en' ? 'en' : 'zh'; } catch (e) { return 'zh'; } })();
 const ZH_ORIG = new WeakMap();

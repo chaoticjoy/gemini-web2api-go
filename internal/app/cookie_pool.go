@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,14 +44,38 @@ func splitCookiePairs(cookie string) [][2]string {
 	return out
 }
 
-// extractSAPISID 从一整串 cookie 里取 SAPISID 的值，取不到返回空串。
-func extractSAPISID(cookie string) string {
+// cookieValue 从一整串 cookie 里取指定名字的值，取不到返回空串。
+func cookieValue(cookie, name string) string {
 	for _, kv := range splitCookiePairs(cookie) {
-		if kv[0] == "SAPISID" {
+		if kv[0] == name {
 			return kv[1]
 		}
 	}
 	return ""
+}
+
+// extractSAPISID 从一整串 cookie 里取 SAPISID 的值，取不到返回空串。
+func extractSAPISID(cookie string) string {
+	return cookieValue(cookie, "SAPISID")
+}
+
+// cookieSubset 只留下指定名字的项，顺序跟原串一致。刷新 1PSIDTS 时不能把整串
+// 都带上：多带 Chrome DBSC / 其它主机的 cookie 实测会让 RotateCookies 回 401。
+func cookieSubset(cookie string, names []string) string {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var parts []string
+	seen := map[string]bool{}
+	for _, kv := range splitCookiePairs(cookie) {
+		if !want[kv[0]] || kv[1] == "" || seen[kv[0]] {
+			continue
+		}
+		seen[kv[0]] = true
+		parts = append(parts, kv[0]+"="+kv[1])
+	}
+	return strings.Join(parts, "; ")
 }
 
 // cookieNames 返回 cookie 串里出现的所有 cookie 名（顺序保留），供 UI 展示。
@@ -364,6 +389,14 @@ func poolHasCookie(cookie string) bool {
 	return false
 }
 
+// pickMu 把「SELECT 最久未用的号 + UPDATE 标记它刚用过」串成原子操作。
+// 不加锁时两个并发请求会 SELECT 到同一个"最久未用"的号、各自 UPDATE，于是同一瞬间
+// 双双用它，轮转形同虚设（CLAUDE.md 记的已知缺陷）。本进程内一把锁就够——限流器、
+// 轮转调度、代理池都是进程内状态，这个反代天生单实例，不存在跨进程并发挑号；也就
+// 不必为此上跨方言的事务/行锁（sqlite 无 FOR UPDATE、mysql 无 RETURNING，那条路
+// 全是方言分支）。挑号只是一次极快的 SELECT+UPDATE，串行化的争用可忽略。
+var pickMu sync.Mutex
+
 // pickCookieAccount 从池里挑一个 enabled 账号，按 last_used_at 最久优先，
 // 挑中后立刻把 last_used_at 记为现在（下次轮到别人）。池空返回 (nil,false)。
 func pickCookieAccount() (*CookieAccount, bool) {
@@ -376,6 +409,8 @@ func pickCookieAccount() (*CookieAccount, bool) {
 // 轮转会让大约一半请求撞上坏号 —— 表现就是"成功率莫名其妙很低"，而每次失败
 // 看起来都像是上游的问题。
 func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
+	pickMu.Lock()
+	defer pickMu.Unlock()
 	// 健康的排前面，同样健康的按最久未用轮转。
 	//
 	// 不这么排的话坏号会跟好号平起平坐地轮到，而挑到坏号时它没有绑定的出口，
