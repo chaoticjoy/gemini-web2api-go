@@ -304,6 +304,11 @@ func pickProxyWithCapacity() (Proxy, bool) { return pickProxyPreferring(0) }
 // 出口 IP 之间来回跳 —— 这在 Google 眼里正是账号共享的特征。粘不住时宁可换出口
 // 也不排队等，可用性优先。
 func pickProxyPreferring(preferID int64) (Proxy, bool) {
+	return pickProxyPreferringExcept(preferID, nil)
+}
+
+// pickProxyPreferringExcept 优先挑 preferID 那个出口，跳过 excludedIDs 中的代理。
+func pickProxyPreferringExcept(preferID int64, excludedIDs map[int64]bool) (Proxy, bool) {
 	proxyMu.RLock()
 	defer proxyMu.RUnlock()
 	if len(proxyCache) == 0 {
@@ -313,6 +318,9 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 	cooldown := rtCfg().ProxyCooldownMin
 	var pool []Proxy
 	for _, p := range proxyCache {
+		if excludedIDs != nil && excludedIDs[p.ID] {
+			continue
+		}
 		if proxyUsable(p, now, cooldown) {
 			pool = append(pool, p)
 		}
@@ -320,7 +328,7 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 	if len(pool) == 0 {
 		return Proxy{}, false
 	}
-	if preferID > 0 {
+	if preferID > 0 && (excludedIDs == nil || !excludedIDs[preferID]) {
 		for _, p := range pool {
 			if p.ID == preferID {
 				if ok, _ := trySlotAcquire(p.ID); ok {
@@ -333,8 +341,8 @@ func pickProxyPreferring(preferID int64) (Proxy, bool) {
 
 	// 粘性模式 (sticky)：优先复用上一次成功的代理 (未指定偏好代理时)
 	if preferID <= 0 && rtCfg().ProxyStrategy == "sticky" {
-		stickyURL, _, _ := getStickyProxy()
-		if stickyURL != "" {
+		stickyURL, stickyID, _ := getStickyProxy()
+		if stickyURL != "" && (excludedIDs == nil || !excludedIDs[stickyID]) {
 			for _, p := range pool {
 				if p.URL == stickyURL {
 					if ok, _ := trySlotAcquire(p.ID); ok {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -154,4 +155,118 @@ func TestProxyModeAcquireSlot(t *testing.T) {
 	rtVal.ProxyPoolURL = ""
 	rtMu.Unlock()
 }
+
+func TestProxyRetryAttemptsConfig(t *testing.T) {
+	cfg := RuntimeConfig{
+		RetryAttempts:  3,
+		RetryDelaySec:  2,
+		RequestTimeout: 180,
+		RetentionDays:  30,
+		DefaultModel:   "gemini-3.6-flash",
+		Impersonate:    "chrome_146",
+		GeminiBL:       "test_bl",
+	}
+
+	// 0 到 10 应合法
+	cfg.ProxyRetryAttempts = 0
+	if err := validateRuntimeConfig(cfg); err != nil {
+		t.Fatalf("expected 0 to be valid, got %v", err)
+	}
+	cfg.ProxyRetryAttempts = 10
+	if err := validateRuntimeConfig(cfg); err != nil {
+		t.Fatalf("expected 10 to be valid, got %v", err)
+	}
+
+	// 超出范围应报错
+	cfg.ProxyRetryAttempts = -1
+	if err := validateRuntimeConfig(cfg); err == nil {
+		t.Fatalf("expected -1 to be invalid")
+	}
+	cfg.ProxyRetryAttempts = 11
+	if err := validateRuntimeConfig(cfg); err == nil {
+		t.Fatalf("expected 11 to be invalid")
+	}
+}
+
+func TestAcquireSlotExceptWithExclusions(t *testing.T) {
+	urls := []string{
+		"socks5://127.0.0.1:1080",
+		"socks5://127.0.0.1:1081",
+	}
+	idx := 0
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		u := urls[idx%len(urls)]
+		idx++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(RemoteProxyItem{
+			URL:  u,
+			Type: "socks5",
+		})
+	}))
+	defer ts.Close()
+
+	rtMu.Lock()
+	rtVal.ProxyMode = "dynamic_only"
+	rtVal.ProxyPoolURL = ts.URL
+	rtVal.ProxyStrategy = "round_robin"
+	rtMu.Unlock()
+	defer func() {
+		rtMu.Lock()
+		rtVal.ProxyMode = "auto"
+		rtVal.ProxyStrategy = "sticky"
+		rtVal.ProxyPoolURL = ""
+		rtMu.Unlock()
+	}()
+
+	// 1. 无排除时，正常获取
+	p1, ok1, err1 := acquireSlotExcept(0, nil, nil)
+	if !ok1 || err1 != nil {
+		t.Fatalf("acquireSlotExcept without exclusions failed: %v", err1)
+	}
+	releaseSlot(p1.ID)
+
+	// 2. 排除 p1.URL，下一次应该拿到另一个 URL
+	excludedURLs := map[string]bool{p1.URL: true}
+	p2, ok2, err2 := acquireSlotExcept(0, nil, excludedURLs)
+	if !ok2 || err2 != nil {
+		t.Fatalf("acquireSlotExcept with exclusion failed: %v", err2)
+	}
+	defer releaseSlot(p2.ID)
+
+	if p2.URL == p1.URL {
+		t.Fatalf("expected different proxy URL, but got %s again", p2.URL)
+	}
+}
+
+func TestPickProxyPreferringExceptStatic(t *testing.T) {
+	proxyMu.Lock()
+	oldCache := proxyCache
+	now := time.Now().Unix()
+	proxyCache = []Proxy{
+		{ID: 101, Name: "Proxy-1", URL: "socks5://1.1.1.1:1080", Enabled: true, LastUsed: now},
+		{ID: 102, Name: "Proxy-2", URL: "socks5://2.2.2.2:1080", Enabled: true, LastUsed: now},
+	}
+	proxyMu.Unlock()
+	defer func() {
+		proxyMu.Lock()
+		proxyCache = oldCache
+		proxyMu.Unlock()
+	}()
+
+	// 排除 101 时优先选 102
+	p, ok := pickProxyPreferringExcept(101, map[int64]bool{101: true})
+	if !ok || p.ID != 102 {
+		t.Fatalf("expected proxy 102, got p=%+v, ok=%v", p, ok)
+	}
+	releaseSlot(p.ID)
+
+	// 排除 101 和 102 时无可用
+	_, okAll := pickProxyPreferringExcept(0, map[int64]bool{101: true, 102: true})
+	if okAll {
+		t.Fatalf("expected no proxy available when all are excluded")
+	}
+}
+
 

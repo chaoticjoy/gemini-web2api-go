@@ -246,98 +246,22 @@ const webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 // cid/rid/rcid/tok26 和 turn+1，供下一轮续接。
 func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
-	p, slotOK, slotErr := acquireSlot(conv.proxyID)
-	if !slotOK {
-		return &StreamResult{}, slotErr
+	maxProxySwitches := rtCfg().ProxyRetryAttempts
+	if maxProxySwitches < 0 {
+		maxProxySwitches = 0
 	}
-	defer releaseSlot(p.ID)
-	proxyURL := p.URL
-	pickedOK := p.ID != 0
+	excludedIDs := map[int64]bool{}
+	excludedURLs := map[string]bool{}
 
-	// 首轮定出口；续接沿用会话原出口（acquireSlot 已优先，但拿不到原出口时只能换，
-	// 换了续接大概率失败，靠调用方回退到全量重发兜底）。
-	if conv.turn == 0 {
-		conv.proxyID = p.ID
-		conv.proxyURL = proxyURL
-		// 匿名首轮：没有登录 cookie，就地拿一份 session cookie 当会话载体。
-		if conv.cookie == "" && !conv.isLogin {
-			c, err := getAnonSession(proxyURL)
-			if err != nil {
-				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name}, fmt.Errorf("建匿名会话失败: %w", err)
-			}
-			conv.cookie = c
+	var currentSlotID int64
+	slotHeld := false
+	releaseCurrentSlot := func() {
+		if slotHeld {
+			releaseSlot(currentSlotID)
+			slotHeld = false
 		}
 	}
-
-	// 登录态每轮要带 at（XSRF）；匿名不要。
-	xsrf := ""
-	if conv.isLogin && conv.cookie != "" {
-		if tok, err := getXSRF(conv.cookie, proxyURL); err == nil {
-			xsrf = tok
-		} else {
-			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID},
-				fmt.Errorf("取 XSRF 失败: %w", err)
-		}
-	}
-
-	inner := make([]interface{}, innerSlots)
-	inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
-	inner[1] = []interface{}{"en"}
-	if conv.turn == 0 {
-		inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
-	} else {
-		// 续接：[cid, rid, rcid(登录)/""(匿名), null×6, tok26]
-		inner[2] = []interface{}{conv.cid, conv.rid, conv.rcid,
-			nil, nil, nil, nil, nil, nil, conv.tok26}
-	}
-	inner[6] = []interface{}{0}
-	inner[7] = 1
-	inner[10] = 1
-	inner[11] = 0
-	inner[17] = []interface{}{[]interface{}{conv.turn}}
-	inner[18] = 0
-	inner[27] = 1
-	inner[30] = []interface{}{4}
-	inner[41] = []interface{}{1}
-	inner[53] = 0
-	reqUUID := uuid.NewString()
-	inner[59] = reqUUID
-	inner[61] = []interface{}{}
-	inner[68] = 1
-	inner[79] = mc.Mode
-	inner[80] = thinkingNormal
-	inner[91] = 0
-	inner[96] = 0
-	if mc.Thinking {
-		inner[80] = thinkingExtended
-		inner[96] = 1
-	}
-
-	innerJSON, _ := json.Marshal(inner)
-	outerJSON, _ := json.Marshal([]interface{}{nil, string(innerJSON)})
-
-	buildBody := func(at string) string {
-		form := url.Values{}
-		form.Set("f.req", string(outerJSON))
-		if at != "" {
-			form.Set("at", at)
-		}
-		return form.Encode()
-	}
-	body := buildBody(xsrf)
-
-	thinkVal := thinkingNormal
-	if mc.Thinking {
-		thinkVal = thinkingExtended
-	}
-	geminiHeaders := buildGeminiHeaders(conv.cookie, conv.sapisid, mc.HexID)
-	geminiHeaders["x-goog-ext-525001261-jspb"] = buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
-	geminiHeaders["x-goog-ext-525005358-jspb"] = fmt.Sprintf(`["%s",1]`, reqUUID)
-
-	reqid := time.Now().UnixNano() % 1000000
-	endpoint := fmt.Sprintf(
-		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid)
+	defer releaseCurrentSlot()
 
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
@@ -364,62 +288,205 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 
 	t0 := time.Now()
 	var lastErr error
-	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
-		if len(setCookie) > 0 && conv.cookie != "" {
-			if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
-				conv.cookie = merged
+
+	for proxySwitch := 0; proxySwitch <= maxProxySwitches; proxySwitch++ {
+		curPrefer := conv.proxyID
+		if proxySwitch > 0 {
+			curPrefer = 0
+		}
+		p, slotOK, slotErr := acquireSlotExcept(curPrefer, excludedIDs, excludedURLs)
+		if !slotOK {
+			if proxySwitch == 0 {
+				return &StreamResult{}, slotErr
+			}
+			logf("[conv] 换代理重试: 无更多可用代理出口（已尝试 %d 个代理），停止切换: %v", proxySwitch, slotErr)
+			break
+		}
+		releaseCurrentSlot()
+		currentSlotID = p.ID
+		slotHeld = true
+
+		proxyURL := p.URL
+		pickedOK := p.ID != 0
+
+		// 首轮定出口；续接沿用会话原出口（拿不到原出口或换代理时更新出口）
+		if conv.turn == 0 || proxySwitch > 0 {
+			conv.proxyID = p.ID
+			conv.proxyURL = proxyURL
+			// 匿名首轮：没有登录 cookie，就地拿一份 session cookie 当会话载体。
+			if conv.cookie == "" && !conv.isLogin {
+				c, err := getAnonSession(proxyURL)
+				if err != nil {
+					lastErr = fmt.Errorf("建匿名会话失败: %w", err)
+					if pickedOK {
+						recordProxyResult(p.ID, false, lastErr.Error())
+					}
+					if proxySwitch < maxProxySwitches {
+						excludedIDs[p.ID] = true
+						if proxyURL != "" {
+							excludedURLs[proxyURL] = true
+						}
+						releaseCurrentSlot()
+						continue
+					}
+					return &StreamResult{ProxyID: p.ID, ProxyName: p.Name}, lastErr
+				}
+				conv.cookie = c
 			}
 		}
-		if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
-			if err == nil && statusCode == 200 {
-				lastErr = fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw))
-			} else if err != nil {
-				lastErr = err
+
+		// 登录态每轮要带 at（XSRF）；匿名不要。
+		xsrf := ""
+		if conv.isLogin && conv.cookie != "" {
+			if tok, err := getXSRF(conv.cookie, proxyURL); err == nil {
+				xsrf = tok
 			} else {
-				lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 160))
+				lastErr = fmt.Errorf("取 XSRF 失败: %w", err)
+				if pickedOK {
+					recordProxyResult(p.ID, false, lastErr.Error())
+				}
+				if proxySwitch < maxProxySwitches {
+					excludedIDs[p.ID] = true
+					if proxyURL != "" {
+						excludedURLs[proxyURL] = true
+					}
+					releaseCurrentSlot()
+					continue
+				}
+				return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, lastErr
 			}
+		}
+
+		inner := make([]interface{}, innerSlots)
+		inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
+		inner[1] = []interface{}{"en"}
+		if conv.turn == 0 {
+			inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
+		} else {
+			// 续接：[cid, rid, rcid(登录)/""(匿名), null×6, tok26]
+			inner[2] = []interface{}{conv.cid, conv.rid, conv.rcid,
+				nil, nil, nil, nil, nil, nil, conv.tok26}
+		}
+		inner[6] = []interface{}{0}
+		inner[7] = 1
+		inner[10] = 1
+		inner[11] = 0
+		inner[17] = []interface{}{[]interface{}{conv.turn}}
+		inner[18] = 0
+		inner[27] = 1
+		inner[30] = []interface{}{4}
+		inner[41] = []interface{}{1}
+		inner[53] = 0
+		reqUUID := uuid.NewString()
+		inner[59] = reqUUID
+		inner[61] = []interface{}{}
+		inner[68] = 1
+		inner[79] = mc.Mode
+		inner[80] = thinkingNormal
+		inner[91] = 0
+		inner[96] = 0
+		if mc.Thinking {
+			inner[80] = thinkingExtended
+			inner[96] = 1
+		}
+
+		innerJSON, _ := json.Marshal(inner)
+		outerJSON, _ := json.Marshal([]interface{}{nil, string(innerJSON)})
+
+		buildBody := func(at string) string {
+			form := url.Values{}
+			form.Set("f.req", string(outerJSON))
+			if at != "" {
+				form.Set("at", at)
+			}
+			return form.Encode()
+		}
+		body := buildBody(xsrf)
+
+		thinkVal := thinkingNormal
+		if mc.Thinking {
+			thinkVal = thinkingExtended
+		}
+		geminiHeaders := buildGeminiHeaders(conv.cookie, conv.sapisid, mc.HexID)
+		geminiHeaders["x-goog-ext-525001261-jspb"] = buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
+		geminiHeaders["x-goog-ext-525005358-jspb"] = fmt.Sprintf(`["%s",1]`, reqUUID)
+
+		reqid := time.Now().UnixNano() % 1000000
+		endpoint := fmt.Sprintf(
+			"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+			currentBL(proxyURL), reqid)
+
+		for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+			statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			if len(setCookie) > 0 && conv.cookie != "" {
+				if merged := mergeSetCookie(conv.cookie, setCookie); merged != conv.cookie {
+					conv.cookie = merged
+				}
+			}
+			if err != nil || statusCode != 200 || !hasContentFrame(string(raw)) {
+				if err == nil && statusCode == 200 {
+					lastErr = fmt.Errorf("续接无内容帧（会话可能已失效，raw %d 字节）", len(raw))
+				} else if err != nil {
+					lastErr = err
+				} else {
+					lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 160))
+				}
+				if pickedOK {
+					recordProxyResult(p.ID, false, lastErr.Error())
+				}
+				if tracker.emitted != "" || rtracker.emitted != "" {
+					break
+				}
+				if attempt < rtCfg().RetryAttempts-1 {
+					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				}
+				continue
+			}
+			// 成功：回填续接状态。
+			cid, rid, rcid, tok26 := parseConvIDs(string(raw))
+			if cid != "" {
+				conv.cid = cid
+			}
+			if rid != "" {
+				conv.rid = rid
+			}
+			if rcid != "" {
+				conv.rcid = rcid
+			}
+			conv.tok26 = tok26 // 每轮更新（可能为空）
+			conv.turn++
 			if pickedOK {
-				recordProxyResult(p.ID, false, lastErr.Error())
+				recordProxyResult(p.ID, true, "")
 			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
+			return &StreamResult{
+				Emitted:          tracker.emitted,
+				EmittedReasoning: rtracker.emitted,
+				Raw:              string(raw),
+				Reasoning:        extractReasoning(string(raw)),
+				UpstreamModel:    extractUpstreamModel(string(raw)),
+				ProxyID:          p.ID,
+				ProxyName:        p.Name,
+				AccountID:        conv.accountID,
+				TTFBMs:           ttfb,
+				TotalMs:          time.Since(t0).Milliseconds(),
+			}, nil
+		}
+
+		if tracker.emitted != "" || rtracker.emitted != "" {
+			break
+		}
+		if proxySwitch < maxProxySwitches {
+			excludedIDs[p.ID] = true
+			if proxyURL != "" {
+				excludedURLs[proxyURL] = true
 			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
+			logf("[conv] 代理 %s (ID %d) 在 %d 次重试后仍失败，准备切换下一个代理 (第 %d/%d 次切换)...",
+				p.Name, p.ID, rtCfg().RetryAttempts, proxySwitch+1, maxProxySwitches)
+			releaseCurrentSlot()
 			continue
 		}
-		// 成功：回填续接状态。
-		cid, rid, rcid, tok26 := parseConvIDs(string(raw))
-		if cid != "" {
-			conv.cid = cid
-		}
-		if rid != "" {
-			conv.rid = rid
-		}
-		if rcid != "" {
-			conv.rcid = rcid
-		}
-		conv.tok26 = tok26 // 每轮更新（可能为空）
-		conv.turn++
-		if pickedOK {
-			recordProxyResult(p.ID, true, "")
-		}
-		return &StreamResult{
-			Emitted:          tracker.emitted,
-			EmittedReasoning: rtracker.emitted,
-			Raw:              string(raw),
-			Reasoning:        extractReasoning(string(raw)),
-			UpstreamModel:    extractUpstreamModel(string(raw)),
-			ProxyID:          p.ID,
-			ProxyName:        p.Name,
-			AccountID:        conv.accountID,
-			TTFBMs:           ttfb,
-			TotalMs:          time.Since(t0).Milliseconds(),
-		}, nil
 	}
-	return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID}, lastErr
+	return &StreamResult{ProxyID: currentSlotID, AccountID: conv.accountID}, lastErr
 }
 
 // callGeminiConv 是多轮开启时的入口：按历史前缀识别续接。

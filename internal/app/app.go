@@ -195,7 +195,8 @@ func Run() {
 	fmt.Printf("  Tokenizer:   %s\n", tokInfo)
 	fmt.Printf("  Per-IP 限流: 并发=%d / RPM=%d / RPH=%d\n",
 		rtCfg().PerIPConcurrent, rtCfg().PerIPRPM, rtCfg().PerIPRPH)
-	fmt.Printf("  Retry:       %dx / %ds\n", rtCfg().RetryAttempts, rtCfg().RetryDelaySec)
+	fmt.Printf("  Retry:       %dx / %ds (proxy switches: %d)\n",
+		rtCfg().RetryAttempts, rtCfg().RetryDelaySec, rtCfg().ProxyRetryAttempts)
 	fmt.Println()
 	warnEnvProxyIgnored()
 

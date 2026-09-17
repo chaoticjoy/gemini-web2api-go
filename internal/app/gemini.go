@@ -216,34 +216,45 @@ func (e *RateLimitError) Error() string {
 }
 
 func fetchOrStickyRemoteProxy(poolURL string) (Proxy, bool) {
+	return fetchOrStickyRemoteProxyExcept(poolURL, nil)
+}
+
+func fetchOrStickyRemoteProxyExcept(poolURL string, excludedURLs map[string]bool) (Proxy, bool) {
 	if rtCfg().ProxyStrategy == "sticky" {
 		sURL, sID, sName := getStickyProxy()
 		if _, isDyn := isDynamicSlot(sID); sURL != "" && isDyn {
-			if ok, _ := trySlotAcquire(sID); ok {
+			if excludedURLs != nil && excludedURLs[sURL] {
+				clearStickyProxy()
+			} else if ok, _ := trySlotAcquire(sID); ok {
 				return Proxy{ID: sID, Name: sName, URL: sURL, Enabled: true}, true
 			}
 		}
 	}
-	pURL, err := fetchRemoteProxy(poolURL)
-	if err != nil {
-		logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
-		return Proxy{}, false
-	}
-	if pURL == "" {
-		return Proxy{}, false
-	}
-	slotID := getDynamicSlotID(pURL)
-	if ok, _ := trySlotAcquire(slotID); ok {
-		pName := "Dynamic (" + pURL + ")"
-		if rtCfg().ProxyStrategy == "sticky" {
-			setStickyProxy(pURL, slotID, pName)
+	for fetchAttempt := 0; fetchAttempt < 3; fetchAttempt++ {
+		pURL, err := fetchRemoteProxy(poolURL)
+		if err != nil {
+			logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
+			return Proxy{}, false
 		}
-		return Proxy{
-			ID:      slotID,
-			Name:    pName,
-			URL:     pURL,
-			Enabled: true,
-		}, true
+		if pURL == "" {
+			return Proxy{}, false
+		}
+		if excludedURLs != nil && excludedURLs[pURL] {
+			continue
+		}
+		slotID := getDynamicSlotID(pURL)
+		if ok, _ := trySlotAcquire(slotID); ok {
+			pName := "Dynamic (" + pURL + ")"
+			if rtCfg().ProxyStrategy == "sticky" {
+				setStickyProxy(pURL, slotID, pName)
+			}
+			return Proxy{
+				ID:      slotID,
+				Name:    pName,
+				URL:     pURL,
+				Enabled: true,
+			}, true
+		}
 	}
 	return Proxy{}, false
 }
@@ -254,6 +265,11 @@ func fetchOrStickyRemoteProxy(poolURL string) (Proxy, bool) {
 //
 // 调用方拿到 (proxy, ok=true) 必须配 deferred releaseSlot()。
 func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
+	return acquireSlotExcept(preferProxyID, nil, nil)
+}
+
+// acquireSlotExcept 在排除指定 proxy ID 和 URL 的前提下选一个有容量的 slot。
+func acquireSlotExcept(preferProxyID int64, excludedIDs map[int64]bool, excludedURLs map[string]bool) (Proxy, bool, error) {
 	mode := rtCfg().ProxyMode
 	if mode == "" {
 		mode = "auto"
@@ -267,6 +283,9 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 
 	switch mode {
 	case "direct_only":
+		if excludedIDs != nil && excludedIDs[0] {
+			return Proxy{ID: 0, Name: "直连"}, false, &RateLimitError{Reason: "excluded", ProxyID: 0}
+		}
 		ok, reason := trySlotAcquire(0)
 		if ok {
 			return Proxy{ID: 0, Name: "直连"}, true, nil
@@ -275,7 +294,7 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 
 	case "static_only":
 		if hasProxies {
-			if p, ok := pickProxyPreferring(preferProxyID); ok {
+			if p, ok := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
 				return p, true, nil
 			}
 		}
@@ -283,7 +302,7 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 
 	case "dynamic_only":
 		if hasPoolURL {
-			if p, ok := fetchOrStickyRemoteProxy(rtCfg().ProxyPoolURL); ok {
+			if p, ok := fetchOrStickyRemoteProxyExcept(rtCfg().ProxyPoolURL, excludedURLs); ok {
 				return p, true, nil
 			}
 		}
@@ -292,12 +311,12 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 	case "pool_only":
 		// 代理优先模式：先试静态，再试动态，绝不直连
 		if hasProxies {
-			if p, ok := pickProxyPreferring(preferProxyID); ok {
+			if p, ok := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
 				return p, true, nil
 			}
 		}
 		if hasPoolURL {
-			if p, ok := fetchOrStickyRemoteProxy(rtCfg().ProxyPoolURL); ok {
+			if p, ok := fetchOrStickyRemoteProxyExcept(rtCfg().ProxyPoolURL, excludedURLs); ok {
 				return p, true, nil
 			}
 		}
@@ -305,12 +324,12 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 
 	default: // "auto" 自动混合模式
 		if hasProxies {
-			if p, ok := pickProxyPreferring(preferProxyID); ok {
+			if p, ok := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
 				return p, true, nil
 			}
 		}
 		if hasPoolURL {
-			if p, ok := fetchOrStickyRemoteProxy(rtCfg().ProxyPoolURL); ok {
+			if p, ok := fetchOrStickyRemoteProxyExcept(rtCfg().ProxyPoolURL, excludedURLs); ok {
 				return p, true, nil
 			}
 		}
@@ -319,6 +338,9 @@ func acquireSlot(preferProxyID int64) (Proxy, bool, error) {
 				return Proxy{ID: -1, Name: "代理池(满/不可用)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 			}
 			logf("[proxy] 代理池无可用出口，本次退回直连（fallback_direct 已开）")
+		}
+		if excludedIDs != nil && excludedIDs[0] {
+			return Proxy{ID: 0, Name: "直连"}, false, &RateLimitError{Reason: "excluded", ProxyID: 0}
 		}
 		ok, reason := trySlotAcquire(0)
 		if ok {
@@ -408,232 +430,27 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}, err
 	}
 
-	// 通过限流器拿一个 slot（代理或直连）。所有 slot 满 → 直接 429。
-	p, slotOK, slotErr := acquireSlot(preferProxy)
-	if !slotOK {
-		return attrib(slotErr)
+	maxProxySwitches := rtCfg().ProxyRetryAttempts
+	if maxProxySwitches < 0 {
+		maxProxySwitches = 0
 	}
-	picked = p
-	defer releaseSlot(picked.ID) // picked.ID=0 表示直连 slot
+	excludedIDs := map[int64]bool{}
+	excludedURLs := map[string]bool{}
 
-	// picked.URL 为空 = 直连 slot。代理只有代理池一个入口，没有别的兜底出口了
-	// （原来那个「静态代理」字段已并进池子，见 seedProxiesFromConfig）。
-	proxyURL := picked.URL
-	pickedOK := picked.ID != 0 // 是否真用了代理池里的代理（包含动态代理 ID<0 和本地代理 ID>0）
+	var currentSlotID int64
+	slotHeld := false
+	releaseCurrentSlot := func() {
+		if slotHeld {
+			releaseSlot(currentSlotID)
+			slotHeld = false
+		}
+	}
+	defer releaseCurrentSlot()
 
-	// endpoint 要等出口定下来才能拼：currentBL 可能顺手踢一次后台抓取，
-	// 那个抓取必须跟正式请求走同一个出口，否则配了代理池也会从本机 IP 漏一次。
-	reqid := time.Now().Unix() % 1000000
-	endpoint := fmt.Sprintf(
-		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid,
-	)
-
-	// 取 XSRF token。一个 cookie 失效不该让整个请求失败：当前号取不到就换下一个，
-	// 最多试 maxCookieTries 个。不这么做的话，池子里 2 个号坏 1 个就会让大约一半
-	// 请求挂掉，而每次失败看起来都像上游的问题，用户只会觉得"成功率莫名很低"。
-	//
-	// 换号**不换出口**：出口已经按第一个号的绑定选定了，同一个请求里再换出口没道理。
 	cookieStr, sapisid, xsrfToken := "", "", ""
 	var lastCookieErr error
 	tried := map[int64]bool{}
-	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
 	rotatedOnce := map[int64]bool{}
-	for acct != nil && len(tried) < maxCookieTries {
-		tried[acct.ID] = true
-		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
-		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		tok, err := getXSRF(acct.Cookie, proxyURL)
-		if err == nil {
-			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
-			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
-			//
-			// 绝不因为"这次走的是别的出口"就覆盖：出口是按**本次第一个挑中的号**
-			// 的绑定选的，而挑号会换（新加的号 last_used_at=0 排在最前，撞上坏号
-			// 就会换）。拿别人的出口覆盖当前号的绑定，等于每次撞上坏号就把好号的
-			// 粘性打散一次 —— 实测就是这么散掉的。
-			if acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID) {
-				bindAccountProxy(acct.ID, picked.ID)
-			}
-			break
-		}
-		// 取不到 SNlM0e 基本等于这个 cookie 已失效（页面把我们当匿名用户了）。
-		// 换号之前先给它一次机会：强制轮转一次再重取。
-		//
-		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
-		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
-		// 只试一次，且只在这一轮。
-		if !rotatedOnce[acct.ID] {
-			rotatedOnce[acct.ID] = true
-			if _, _, rerr := rotateAccount(*acct); rerr == nil {
-				if fresh := accountByID(acct.ID); fresh != nil {
-					if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
-						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
-						acct = fresh
-						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
-						if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
-							bindAccountProxy(fresh.ID, picked.ID)
-						}
-						break
-					}
-				}
-			}
-		}
-		// 救不回来：记一次失败让面板上看得出是哪个号该换了，然后换下一个。
-		markCookieByStatus(acct.ID, 401, err.Error())
-		lastCookieErr = err
-		logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
-		acct, _ = pickCookieAccountExcept(tried) // 取不到时返回 nil，循环自然结束
-	}
-	if lastCookieErr != nil && cookieStr == "" {
-		if !rtCfg().FallbackAnon {
-			// 默认报错而不是降级：cookie 失效后上游不会拒绝，只是把你当匿名用户，
-			// 纯文本请求照样 200 —— 于是 3.1 Pro 被静默降级成 3.5 Flash-Lite、
-			// 思考链消失，客户端完全看不出来。宁可明确失败也不给假的成功。
-			return attrib(fmt.Errorf("cookie 池里 %d 个账号都不可用（最后一个：%w）；"+
-				"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
-				len(tried), lastCookieErr))
-		}
-		logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
-		cookieID, cookieLabel = 0, ""
-	}
-	// 图片附件：上传要 cookie，而且必须走跟正式请求同一个出口，所以排在这里。
-	if len(pending) > 0 {
-		if cookieStr == "" {
-			return attrib(fmt.Errorf("image input needs a Google account cookie: " +
-				"anonymous uploads succeed but referencing them in a conversation is " +
-				"rejected upstream. Add a cookie in the admin panel (Cookie pool)"))
-		}
-		nImg, nVid := 0, 0
-		for _, u := range pending {
-			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
-			if uerr != nil {
-				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
-			}
-			files = append(files, fileRef{Ref: ref, Name: u.Name, Kind: u.Kind, Mime: u.Mime})
-			if u.Kind == 2 {
-				nVid++
-			} else {
-				nImg++
-			}
-		}
-		logf("[vision] 上传了 %d 张图 / %d 个视频", nImg, nVid)
-	}
-
-	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
-	// 而且必须走跟正式请求同一个出口。
-	budget := rtCfg().MaxPromptBytes
-	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL); ferr != nil {
-		return attrib(ferr)
-	} else if used {
-		prompt = p
-		files = append(files, f...)
-	}
-	if budget > 0 && len(prompt) > budget {
-		return attrib(&PromptTooLongError{
-			Bytes: len(prompt), Budget: budget, HasCookie: cookieStr != "",
-		})
-	}
-
-	inner := make([]interface{}, innerSlots)
-	if len(files) > 0 {
-		// 形状逐字取自浏览器抓包：
-		//   [[[路径, 类型, null, mime], "文件名", null×6, [0]], …]
-		// 类型位是 1=图片 / 3=文本文件 —— 拿 1 传文本文件等于告诉服务端"这是张图"。
-		refs := make([]interface{}, 0, len(files))
-		for _, f := range files {
-			kind := f.Kind
-			if kind == 0 {
-				kind = 3
-			}
-			mime := f.Mime
-			if mime == "" {
-				mime = "text/plain"
-			}
-			refs = append(refs, []interface{}{
-				[]interface{}{f.Ref, kind, nil, mime}, f.Name,
-				nil, nil, nil, nil, nil, nil,
-				[]interface{}{0},
-			})
-		}
-		inner[0] = []interface{}{prompt, 0, nil, refs, nil, nil, 0}
-	} else {
-		inner[0] = []interface{}{prompt, 0, nil, nil, nil, nil, 0}
-	}
-	inner[1] = []interface{}{"en"}
-	inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
-	inner[6] = []interface{}{0}
-	inner[7] = 1
-	inner[10] = 1
-	inner[11] = 0
-	inner[17] = []interface{}{[]interface{}{0}}
-	inner[18] = 0
-	inner[27] = 1
-	inner[30] = []interface{}{4}
-	// 抓包里浏览器三种场景（有 cookie / 无 cookie / 扩展思考）全是 [1]。
-	// 我们原来写 [2]，是早期抄来的值、协议层已被证伪。含义仍未知，
-	// 匿名两个值都能通，但没有理由继续偏离浏览器。
-	inner[41] = []interface{}{1}
-	inner[53] = 0
-	reqUUID := uuid.NewString()
-	inner[59] = reqUUID
-	inner[61] = []interface{}{}
-	inner[68] = 1
-	inner[79] = mc.Mode
-	inner[80] = thinkingNormal
-	inner[91] = 0
-	inner[96] = 0
-	if mc.Thinking {
-		inner[80] = thinkingExtended
-		inner[96] = 1
-	}
-	// 媒体工具开关。填了服务端就换后端模型出图/出乐（响应里带产物引用，字节要另取）。
-	if mc.Tool > 0 {
-		inner[49] = mc.Tool
-	}
-	// 视频还要在 inner[55] 指定画幅比例：[[16]]=16:9，[[17]]=9:16（抓包）。
-	if mc.Tool == toolVideo {
-		inner[55] = []interface{}{[]interface{}{16}}
-	}
-
-	innerJSON, err := json.Marshal(inner)
-	if err != nil {
-		return nil, err
-	}
-	outer := []interface{}{nil, string(innerJSON)}
-	outerJSON, err := json.Marshal(outer)
-	if err != nil {
-		return nil, err
-	}
-
-	// 带 cookie 时必须多发一个表单字段 at（XSRF token），否则上游直接 400。
-	// 匿名请求不需要，getXSRF 对空 cookie 返回空串。见 xsrf.go。
-	buildBody := func(at string) string {
-		form := url.Values{}
-		form.Set("f.req", string(outerJSON))
-		if at != "" {
-			form.Set("at", at)
-		}
-		return form.Encode()
-	}
-
-	body := buildBody(xsrfToken)
-
-	thinkVal := thinkingNormal
-	if mc.Thinking {
-		thinkVal = thinkingExtended
-	}
-	// 抓包里 header 下标 16 和 inner[59] 是两个不同的 uuid，各生成各的。
-	modelHeader := buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
-	sessionHeader := fmt.Sprintf(`["%s",1]`, reqUUID)
-
-	geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
-	geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
-	geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
-	var lastErr error
-	var lastStatus int
-	xsrfRetried := false
-	t0 := time.Now()
 
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
@@ -658,124 +475,344 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 	}
 
-	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
-		if len(setCookie) > 0 && cookieID > 0 {
-			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
-				cookieStr = merged
-				updateAccountCookie(cookieID, merged)
+	var lastErr error
+	var lastStatus int
+	t0 := time.Now()
+
+	for proxySwitch := 0; proxySwitch <= maxProxySwitches; proxySwitch++ {
+		curPrefer := preferProxy
+		if proxySwitch > 0 {
+			curPrefer = 0
+		}
+		p, slotOK, slotErr := acquireSlotExcept(curPrefer, excludedIDs, excludedURLs)
+		if !slotOK {
+			if proxySwitch == 0 {
+				return attrib(slotErr)
+			}
+			logf("[proxy] 换代理重试: 无更多可用代理出口（已尝试 %d 个代理），停止切换: %v", proxySwitch, slotErr)
+			break
+		}
+		releaseCurrentSlot()
+		picked = p
+		currentSlotID = picked.ID
+		slotHeld = true
+
+		proxyURL := picked.URL
+		pickedOK := picked.ID != 0
+
+		// 取 XSRF token。
+		if cookieStr == "" && acct != nil && len(tried) < maxCookieTries {
+			for acct != nil && len(tried) < maxCookieTries {
+				tried[acct.ID] = true
+				cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
+				tok, err := getXSRF(acct.Cookie, proxyURL)
+				if err == nil {
+					cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
+					if acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID) {
+						bindAccountProxy(acct.ID, picked.ID)
+					}
+					break
+				}
+				if !rotatedOnce[acct.ID] {
+					rotatedOnce[acct.ID] = true
+					if _, _, rerr := rotateAccount(*acct); rerr == nil {
+						if fresh := accountByID(acct.ID); fresh != nil {
+							if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
+								logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
+								acct = fresh
+								cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
+								if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
+									bindAccountProxy(fresh.ID, picked.ID)
+								}
+								break
+							}
+						}
+					}
+				}
+				markCookieByStatus(acct.ID, 401, err.Error())
+				lastCookieErr = err
+				logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
+				acct, _ = pickCookieAccountExcept(tried)
 			}
 		}
-		if err != nil {
-			lastErr = err
-			if pickedOK {
-				recordProxyResult(picked.ID, false, err.Error())
+		if lastCookieErr != nil && cookieStr == "" {
+			if !rtCfg().FallbackAnon {
+				return attrib(fmt.Errorf("cookie 池里 %d 个账号都不可用（最后一个：%w）；"+
+					"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
+					len(tried), lastCookieErr))
 			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
+			logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
+			cookieID, cookieLabel = 0, ""
 		}
-		if statusCode != 200 {
-			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
-				xsrfRetried = true
-				invalidateXSRF(cookieStr)
-				if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
-					body = buildBody(tok)
-					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
-					geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
-					geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
-					attempt--
-					continue
+
+		if len(pending) > 0 && len(files) == 0 {
+			if cookieStr == "" {
+				return attrib(fmt.Errorf("image input needs a Google account cookie: " +
+					"anonymous uploads succeed but referencing them in a conversation is " +
+					"rejected upstream. Add a cookie in the admin panel (Cookie pool)"))
+			}
+			nImg, nVid := 0, 0
+			uploadFailed := false
+			for _, u := range pending {
+				ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
+				if uerr != nil {
+					lastErr = fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr)
+					uploadFailed = true
+					break
+				}
+				files = append(files, fileRef{Ref: ref, Name: u.Name, Kind: u.Kind, Mime: u.Mime})
+				if u.Kind == 2 {
+					nVid++
+				} else {
+					nImg++
 				}
 			}
-			lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 200))
-			lastStatus = statusCode
+			if uploadFailed {
+				if pickedOK {
+					recordProxyResult(picked.ID, false, lastErr.Error())
+				}
+				if proxySwitch < maxProxySwitches {
+					excludedIDs[picked.ID] = true
+					if proxyURL != "" {
+						excludedURLs[proxyURL] = true
+					}
+					logf("[proxy] 代理 %s (ID %d) 上传附件失败，切换下一个代理 (第 %d/%d 次切换)...: %v",
+						picked.Name, picked.ID, proxySwitch+1, maxProxySwitches, lastErr)
+					releaseCurrentSlot()
+					continue
+				}
+				return attrib(lastErr)
+			}
+			logf("[vision] 上传了 %d 张图 / %d 个视频", nImg, nVid)
+		}
+
+		curPrompt := prompt
+		budget := rtCfg().MaxPromptBytes
+		if p, f, used, ferr := prepareContextFile(curPrompt, latest, budget, cookieStr, proxyURL); ferr != nil {
+			return attrib(ferr)
+		} else if used {
+			curPrompt = p
+			files = append(files, f...)
+		}
+		if budget > 0 && len(curPrompt) > budget {
+			return attrib(&PromptTooLongError{
+				Bytes: len(curPrompt), Budget: budget, HasCookie: cookieStr != "",
+			})
+		}
+
+		inner := make([]interface{}, innerSlots)
+		if len(files) > 0 {
+			refs := make([]interface{}, 0, len(files))
+			for _, f := range files {
+				kind := f.Kind
+				if kind == 0 {
+					kind = 3
+				}
+				mime := f.Mime
+				if mime == "" {
+					mime = "text/plain"
+				}
+				refs = append(refs, []interface{}{
+					[]interface{}{f.Ref, kind, nil, mime}, f.Name,
+					nil, nil, nil, nil, nil, nil,
+					[]interface{}{0},
+				})
+			}
+			inner[0] = []interface{}{curPrompt, 0, nil, refs, nil, nil, 0}
+		} else {
+			inner[0] = []interface{}{curPrompt, 0, nil, nil, nil, nil, 0}
+		}
+		inner[1] = []interface{}{"en"}
+		inner[2] = []interface{}{"", "", "", nil, nil, nil, nil, nil, nil, ""}
+		inner[6] = []interface{}{0}
+		inner[7] = 1
+		inner[10] = 1
+		inner[11] = 0
+		inner[17] = []interface{}{[]interface{}{0}}
+		inner[18] = 0
+		inner[27] = 1
+		inner[30] = []interface{}{4}
+		inner[41] = []interface{}{1}
+		inner[53] = 0
+		reqUUID := uuid.NewString()
+		inner[59] = reqUUID
+		inner[61] = []interface{}{}
+		inner[68] = 1
+		inner[79] = mc.Mode
+		inner[80] = thinkingNormal
+		inner[91] = 0
+		inner[96] = 0
+		if mc.Thinking {
+			inner[80] = thinkingExtended
+			inner[96] = 1
+		}
+		if mc.Tool > 0 {
+			inner[49] = mc.Tool
+		}
+		if mc.Tool == toolVideo {
+			inner[55] = []interface{}{[]interface{}{16}}
+		}
+
+		innerJSON, err := json.Marshal(inner)
+		if err != nil {
+			return nil, err
+		}
+		outer := []interface{}{nil, string(innerJSON)}
+		outerJSON, err := json.Marshal(outer)
+		if err != nil {
+			return nil, err
+		}
+
+		buildBody := func(at string) string {
+			form := url.Values{}
+			form.Set("f.req", string(outerJSON))
+			if at != "" {
+				form.Set("at", at)
+			}
+			return form.Encode()
+		}
+
+		body := buildBody(xsrfToken)
+
+		thinkVal := thinkingNormal
+		if mc.Thinking {
+			thinkVal = thinkingExtended
+		}
+		modelHeader := buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
+		sessionHeader := fmt.Sprintf(`["%s",1]`, reqUUID)
+
+		geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+		geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
+		geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
+
+		reqid := time.Now().Unix() % 1000000
+		endpoint := fmt.Sprintf(
+			"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+			currentBL(proxyURL), reqid,
+		)
+
+		xsrfRetried := false
+
+		for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
+			statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			if len(setCookie) > 0 && cookieID > 0 {
+				if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
+					cookieStr = merged
+					updateAccountCookie(cookieID, merged)
+				}
+			}
+			if err != nil {
+				lastErr = err
+				if pickedOK {
+					recordProxyResult(picked.ID, false, err.Error())
+				}
+				if tracker.emitted != "" || rtracker.emitted != "" {
+					break
+				}
+				if attempt < rtCfg().RetryAttempts-1 {
+					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
+					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				}
+				continue
+			}
+			if statusCode != 200 {
+				if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
+					xsrfRetried = true
+					invalidateXSRF(cookieStr)
+					if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
+						body = buildBody(tok)
+						geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+						geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
+						geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
+						attempt--
+						continue
+					}
+				}
+				lastErr = fmt.Errorf("upstream HTTP %d: %s", statusCode, truncate(string(raw), 200))
+				lastStatus = statusCode
+				if pickedOK {
+					recordProxyResult(picked.ID, false, lastErr.Error())
+				}
+				if tracker.emitted != "" || rtracker.emitted != "" {
+					break
+				}
+				if attempt < rtCfg().RetryAttempts-1 {
+					logf("retry %d/%d (HTTP %d): %v", attempt+1, rtCfg().RetryAttempts, statusCode, lastErr)
+					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				}
+				continue
+			}
+			if !hasContentFrame(string(raw)) {
+				lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
+				if pickedOK {
+					recordProxyResult(picked.ID, false, lastErr.Error())
+				}
+				if tracker.emitted != "" || rtracker.emitted != "" {
+					break
+				}
+				if attempt < rtCfg().RetryAttempts-1 {
+					logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
+					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				}
+				continue
+			}
 			if pickedOK {
-				recordProxyResult(picked.ID, false, lastErr.Error())
+				recordProxyResult(picked.ID, true, "")
 			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
+			markCookieByStatus(cookieID, 200, "")
+			result := &StreamResult{
+				Emitted:          tracker.emitted,
+				EmittedReasoning: rtracker.emitted,
+				Raw:              string(raw),
+				Reasoning:        extractReasoning(string(raw)),
+				UpstreamModel:    extractUpstreamModel(string(raw)),
+				ProxyID:          picked.ID,
+				ProxyName:        picked.Name,
+				AccountID:        cookieID,
+				AccountLabel:     cookieLabel,
+				TTFBMs:           ttfb,
+				TotalMs:          time.Since(t0).Milliseconds(),
 			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d (HTTP %d): %v", attempt+1, rtCfg().RetryAttempts, statusCode, lastErr)
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+			if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
+				mime := "image/png"
+				switch mc.Tool {
+				case toolMusic:
+					mime = "audio/mpeg"
+				case toolVideo:
+					mime = "video/mp4"
+				}
+				arts, aerr := fetchMediaArtifacts(
+					mc.Tool, string(raw), extractConversationID(string(raw)),
+					cookieStr, sapisid, xsrfToken, proxyURL, mime)
+				if aerr != nil {
+					logf("[media] 取回产物失败: %v", aerr)
+					result.MediaErr = aerr.Error()
+				} else {
+					result.Artifacts = arts
+					logf("[media] 取回 %d 份产物", len(arts))
+				}
 			}
+			if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
+				if cid := extractConversationID(string(raw)); cid != "" {
+					go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
+				}
+			}
+			return result, nil
+		}
+
+		if tracker.emitted != "" || rtracker.emitted != "" {
+			break
+		}
+		if proxySwitch < maxProxySwitches {
+			excludedIDs[picked.ID] = true
+			if proxyURL != "" {
+				excludedURLs[proxyURL] = true
+			}
+			logf("[proxy] 代理 %s (ID %d) 在 %d 次重试后仍失败，准备切换下一个代理 (第 %d/%d 次切换)...",
+				picked.Name, picked.ID, rtCfg().RetryAttempts, proxySwitch+1, maxProxySwitches)
+			releaseCurrentSlot()
 			continue
 		}
-		// HTTP 200 但一个内容帧都没有 —— 上游的瞬时拒绝（响应里那个 1155）。
-		// 它不是限流：干净 IP 间隔 1s 连打 15 次全过、同 IP 并发 10 共 18 次全过、
-		// 打了 60+ 次的 IP 之后照样成功，没有可预测阈值，同样的请求有时成功有时失败。
-		// 重发一次通常就好，所以必须纳入重试——不然一次抖动就变成客户端可见的 502。
-		//
-		// 判据是**有没有内容帧**，不是 BardErrorInfo：正常响应的结束帧里也带错误码
-		// （1096 = 会话未持久化），拿它判错会把每个正常响应都判成失败。
-		if !hasContentFrame(string(raw)) {
-			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
-			if pickedOK {
-				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
-				// 脏出口一天约 9 次），连续踩中说明这个出口该歇了。
-				recordProxyResult(picked.ID, false, lastErr.Error())
-			}
-			if tracker.emitted != "" || rtracker.emitted != "" {
-				break
-			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
-				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
-			}
-			continue
-		}
-		if pickedOK {
-			recordProxyResult(picked.ID, true, "")
-		}
-		markCookieByStatus(cookieID, 200, "")
-		result := &StreamResult{
-			Emitted:          tracker.emitted,
-			EmittedReasoning: rtracker.emitted,
-			Raw:              string(raw),
-			Reasoning:        extractReasoning(string(raw)),
-			UpstreamModel:    extractUpstreamModel(string(raw)),
-			ProxyID:          picked.ID,
-			ProxyName:        picked.Name,
-			AccountID:        cookieID,
-			AccountLabel:     cookieLabel,
-			TTFBMs:           ttfb,
-			TotalMs:          time.Since(t0).Milliseconds(),
-		}
-		// 媒体模型：生成的产物字节不在这条响应里，要用同一套 cookie / 出口再走一遍
-		// hNvQHb + 下载 host 取回。取不到就记 MediaErr，让上层报错而不是返回半成品。
-		if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
-			mime := "image/png"
-			switch mc.Tool {
-			case toolMusic:
-				mime = "audio/mpeg"
-			case toolVideo:
-				mime = "video/mp4"
-			}
-			arts, aerr := fetchMediaArtifacts(
-				mc.Tool, string(raw), extractConversationID(string(raw)),
-				cookieStr, sapisid, xsrfToken, proxyURL, mime)
-			if aerr != nil {
-				logf("[media] 取回产物失败: %v", aerr)
-				result.MediaErr = aerr.Error()
-			} else {
-				result.Artifacts = arts
-				logf("[media] 取回 %d 份产物", len(arts))
-			}
-		}
-		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
-		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
-		if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
-			if cid := extractConversationID(string(raw)); cid != "" {
-				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
-			}
-		}
-		return result, nil
 	}
 
 	if lastErr != nil {

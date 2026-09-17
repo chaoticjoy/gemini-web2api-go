@@ -20,9 +20,10 @@ import (
 // 否则它不在 body 里、每次点「保存并生效」都被解成零值冲掉（multi_turn 就这么被静默
 // 重置过，连 config.json 里设的都白设，见 #27）。
 type RuntimeConfig struct {
-	RetryAttempts   int    `json:"retry_attempts"`
-	RetryDelaySec   int    `json:"retry_delay_sec"`
-	RequestTimeout  int    `json:"request_timeout_sec"`
+	RetryAttempts      int    `json:"retry_attempts"`
+	RetryDelaySec      int    `json:"retry_delay_sec"`
+	ProxyRetryAttempts int    `json:"proxy_retry_attempts"`
+	RequestTimeout     int    `json:"request_timeout_sec"`
 	DefaultModel    string `json:"default_model"`
 	PerIPConcurrent int    `json:"per_ip_concurrent"`
 	PerIPRPM        int    `json:"per_ip_rpm"`
@@ -74,9 +75,10 @@ var (
 // 必须在 DB 打开之后调用。
 func initRuntimeConfig() {
 	base := RuntimeConfig{
-		RetryAttempts:   cfg.RetryAttempts,
-		RetryDelaySec:   cfg.RetryDelaySec,
-		RequestTimeout:  cfg.RequestTimeout,
+		RetryAttempts:      cfg.RetryAttempts,
+		RetryDelaySec:      cfg.RetryDelaySec,
+		ProxyRetryAttempts: cfg.ProxyRetryAttempts,
+		RequestTimeout:     cfg.RequestTimeout,
 		DefaultModel:    cfg.DefaultModel,
 		PerIPConcurrent: cfg.PerIPConcurrent,
 		PerIPRPM:        cfg.PerIPRPM,
@@ -142,6 +144,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 	for _, r := range []rangeCheck{
 		{"retry_attempts", c.RetryAttempts, 1, 10},
 		{"retry_delay_sec", c.RetryDelaySec, 0, 60},
+		{"proxy_retry_attempts", c.ProxyRetryAttempts, 0, 10},
 		{"request_timeout_sec", c.RequestTimeout, 5, 600},
 		{"per_ip_concurrent", c.PerIPConcurrent, 0, 1000},
 		{"per_ip_rpm", c.PerIPRPM, 0, 10000},

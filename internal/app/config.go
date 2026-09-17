@@ -9,9 +9,10 @@ import (
 type Config struct {
 	Port           int    `json:"port"`
 	Host           string `json:"host"`
-	RetryAttempts  int    `json:"retry_attempts"`
-	RetryDelaySec  int    `json:"retry_delay_sec"`
-	RequestTimeout int    `json:"request_timeout_sec"`
+	RetryAttempts      int    `json:"retry_attempts"`
+	RetryDelaySec      int    `json:"retry_delay_sec"`
+	ProxyRetryAttempts int    `json:"proxy_retry_attempts"` // 单代理重试耗尽后换代理重试次数上限（0=不换代理）
+	RequestTimeout     int    `json:"request_timeout_sec"`
 	GeminiBL       string `json:"gemini_bl"`
 	DefaultModel   string `json:"default_model"`
 	LogRequests    bool   `json:"log_requests"`
@@ -61,9 +62,10 @@ func defaultConfig() Config {
 	return Config{
 		Port:           8083,
 		Host:           "0.0.0.0",
-		RetryAttempts:  3,
-		RetryDelaySec:  2,
-		RequestTimeout: 180,
+		RetryAttempts:      3,
+		RetryDelaySec:      2,
+		ProxyRetryAttempts: 2,
+		RequestTimeout:     180,
 		GeminiBL:       "boq_assistant-bard-web-server_20260525.09_p0",
 		DefaultModel:   "gemini-3.6-flash",
 		LogRequests:    true,
