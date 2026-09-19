@@ -223,14 +223,15 @@ func fetchOrStickyRemoteProxyExcept(poolURL string, excludedURLs map[string]bool
 	if rtCfg().ProxyStrategy == "sticky" {
 		sURL, sID, sName := getStickyProxy()
 		if _, isDyn := isDynamicSlot(sID); sURL != "" && isDyn {
-			if excludedURLs != nil && excludedURLs[sURL] {
+			if (excludedURLs != nil && excludedURLs[sURL]) || isDynamicProxyCooling(sURL) {
 				clearStickyProxy()
 			} else if ok, _ := trySlotAcquire(sID); ok {
 				return Proxy{ID: sID, Name: sName, URL: sURL, Enabled: true}, true
 			}
 		}
 	}
-	for fetchAttempt := 0; fetchAttempt < 3; fetchAttempt++ {
+	const maxFetchAttempts = 10
+	for fetchAttempt := 0; fetchAttempt < maxFetchAttempts; fetchAttempt++ {
 		pURL, err := fetchRemoteProxy(poolURL)
 		if err != nil {
 			logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
@@ -239,7 +240,7 @@ func fetchOrStickyRemoteProxyExcept(poolURL string, excludedURLs map[string]bool
 		if pURL == "" {
 			return Proxy{}, false
 		}
-		if excludedURLs != nil && excludedURLs[pURL] {
+		if (excludedURLs != nil && excludedURLs[pURL]) || isDynamicProxyCooling(pURL) {
 			continue
 		}
 		slotID := getDynamicSlotID(pURL)

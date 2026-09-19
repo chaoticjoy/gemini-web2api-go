@@ -291,7 +291,7 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 
 	for proxySwitch := 0; proxySwitch <= maxProxySwitches; proxySwitch++ {
 		curPrefer := conv.proxyID
-		if proxySwitch > 0 {
+		if proxySwitch > 0 || (conv.proxyURL != "" && isDynamicProxyCooling(conv.proxyURL)) {
 			curPrefer = 0
 		}
 		p, slotOK, slotErr := acquireSlotExcept(curPrefer, excludedIDs, excludedURLs)

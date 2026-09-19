@@ -269,4 +269,110 @@ func TestPickProxyPreferringExceptStatic(t *testing.T) {
 	}
 }
 
+func TestDynamicProxyCooldown(t *testing.T) {
+	u1 := "socks5://10.0.0.1:1080"
+	u2 := "socks5://10.0.0.2:1080"
+
+	// 确保重置状态
+	dynamicStatsMu.Lock()
+	delete(dynamicStats, u1)
+	delete(dynamicStats, u2)
+	dynamicStatsMu.Unlock()
+	defer func() {
+		dynamicStatsMu.Lock()
+		delete(dynamicStats, u1)
+		delete(dynamicStats, u2)
+		dynamicStatsMu.Unlock()
+	}()
+
+	rtMu.Lock()
+	oldCooldown := rtVal.ProxyCooldownMin
+	oldRetry := rtVal.RetryAttempts
+	rtVal.ProxyCooldownMin = 120
+	rtVal.RetryAttempts = 3
+	rtMu.Unlock()
+	defer func() {
+		rtMu.Lock()
+		rtVal.ProxyCooldownMin = oldCooldown
+		rtVal.RetryAttempts = oldRetry
+		rtMu.Unlock()
+	}()
+
+	// 1. 初始状态：未冷却
+	if isDynamicProxyCooling(u1) {
+		t.Fatalf("expected u1 not cooling initially")
+	}
+
+	// 2. 失败 2 次：未达到重试次数 3
+	for i := 0; i < 2; i++ {
+		recordDynamicProxyResult(u1, false, "timeout")
+	}
+	if isDynamicProxyCooling(u1) {
+		t.Fatalf("expected u1 not cooling after 2 failures (threshold=3)")
+	}
+
+	// 3. 失败第 3 次：达到重试次数，进入冷却
+	recordDynamicProxyResult(u1, false, "connection refused")
+	if !isDynamicProxyCooling(u1) {
+		t.Fatalf("expected u1 to be in cooling after 3 failures (threshold=3)")
+	}
+
+	// 4. Mock 动态代理池返回 u1 和 u2，测试 fetchOrStickyRemoteProxyExcept 自动跳过冷却中的 u1
+	urls := []string{u1, u2}
+	idx := 0
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		u := urls[idx%len(urls)]
+		idx++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(RemoteProxyItem{
+			URL:  u,
+			Type: "socks5",
+		})
+	}))
+	defer ts.Close()
+
+	rtMu.Lock()
+	rtVal.ProxyMode = "dynamic_only"
+	rtVal.ProxyPoolURL = ts.URL
+	rtVal.ProxyStrategy = "round_robin"
+	rtMu.Unlock()
+	defer func() {
+		rtMu.Lock()
+		rtVal.ProxyMode = "auto"
+		rtVal.ProxyStrategy = "sticky"
+		rtVal.ProxyPoolURL = ""
+		rtMu.Unlock()
+	}()
+
+	// 因为 u1 在冷却中，即使代理池轮询返回 u1，fetchOrStickyRemoteProxyExcept 也应该自动跳过 u1 并拿到 u2
+	p, ok := fetchOrStickyRemoteProxyExcept(ts.URL, nil)
+	if !ok {
+		t.Fatalf("fetchOrStickyRemoteProxyExcept failed to find usable proxy")
+	}
+	defer releaseSlot(p.ID)
+	if p.URL != u2 {
+		t.Fatalf("expected proxy %s (since u1 is in cooling), got %s", u2, p.URL)
+	}
+
+	// 5. 成功后恢复：recordDynamicProxyResult 成功清零
+	recordDynamicProxyResult(u1, true, "")
+	if isDynamicProxyCooling(u1) {
+		t.Fatalf("expected u1 not cooling after success")
+	}
+
+	// 6. proxy_cooldown_min = 0 时禁用冷却
+	recordDynamicProxyResult(u1, false, "err")
+	for i := 0; i < 5; i++ {
+		recordDynamicProxyResult(u1, false, "err")
+	}
+	rtMu.Lock()
+	rtVal.ProxyCooldownMin = 0
+	rtMu.Unlock()
+	if isDynamicProxyCooling(u1) {
+		t.Fatalf("expected u1 not cooling when ProxyCooldownMin == 0")
+	}
+}
+
 

@@ -57,6 +57,79 @@ func isDynamicSlot(id int64) (string, bool) {
 	return url, ok
 }
 
+type dynamicProxyStat struct {
+	failCount int
+	lastUsed  int64
+	lastError string
+}
+
+var (
+	dynamicStatsMu sync.RWMutex
+	dynamicStats   = map[string]*dynamicProxyStat{}
+)
+
+func recordDynamicProxyResult(proxyURL string, success bool, errStr string) {
+	if proxyURL == "" {
+		return
+	}
+	dynamicStatsMu.Lock()
+	defer dynamicStatsMu.Unlock()
+
+	now := time.Now().Unix()
+	st, ok := dynamicStats[proxyURL]
+	if !ok {
+		st = &dynamicProxyStat{}
+		dynamicStats[proxyURL] = st
+	}
+	st.lastUsed = now
+	if success {
+		st.failCount = 0
+		st.lastError = ""
+	} else {
+		st.failCount++
+		st.lastError = errStr
+		cooldownMin := rtCfg().ProxyCooldownMin
+		threshold := proxyFailThreshold()
+		if st.failCount == threshold && cooldownMin > 0 {
+			logf("[proxy-dynamic] 动态代理 %s 连续失败达到重试上限（%d 次），进入熔断冷却（%d 分钟）", proxyURL, threshold, cooldownMin)
+		}
+	}
+
+	if len(dynamicStats) > 500 {
+		cooldownSec := int64(rtCfg().ProxyCooldownMin) * 60
+		if cooldownSec <= 0 {
+			cooldownSec = 7200
+		}
+		for k, v := range dynamicStats {
+			if now-v.lastUsed > cooldownSec*2 && v.failCount == 0 {
+				delete(dynamicStats, k)
+			}
+		}
+	}
+}
+
+// isDynamicProxyCooling 判断动态代理是否处于冷却期
+func isDynamicProxyCooling(proxyURL string) bool {
+	if proxyURL == "" {
+		return false
+	}
+	cooldownMin := rtCfg().ProxyCooldownMin
+	if cooldownMin <= 0 {
+		return false
+	}
+	dynamicStatsMu.RLock()
+	st, ok := dynamicStats[proxyURL]
+	dynamicStatsMu.RUnlock()
+	if !ok || st == nil {
+		return false
+	}
+	if st.failCount < proxyFailThreshold() {
+		return false
+	}
+	now := time.Now().Unix()
+	return now-st.lastUsed < int64(cooldownMin)*60
+}
+
 // loadProxies 从 DB 刷新内存里的代理列表。
 //
 // 读一半失败时**保留上一次的池子**，绝不用半截结果覆盖。
@@ -125,8 +198,15 @@ func clearStickyProxy() {
 	stickyMu.Unlock()
 }
 
-// 连续失败到这个次数就把代理熔断，等冷却期过了再放回池子。
-const proxyFailThreshold = 5
+// proxyFailThreshold 获取代理熔断失败阈值：直接对齐面板设置的「重试次数」（retry_attempts）。
+// 如果配置非法或未设置，回退保底为 1。
+func proxyFailThreshold() int {
+	t := rtCfg().RetryAttempts
+	if t <= 0 {
+		return 1
+	}
+	return t
+}
 
 // proxyUsable 判断这条代理现在能不能用。
 //
@@ -140,7 +220,7 @@ func proxyUsable(p Proxy, now int64, cooldownMin int) bool {
 	if !p.Enabled {
 		return false
 	}
-	if p.FailCount < proxyFailThreshold {
+	if p.FailCount < proxyFailThreshold() {
 		return true
 	}
 	if cooldownMin <= 0 {
@@ -385,6 +465,7 @@ func recordProxyResult(id int64, success bool, errStr string) {
 		clearStickyProxy()
 	}
 	if pURL, isDyn := isDynamicSlot(id); isDyn {
+		recordDynamicProxyResult(pURL, success, errStr)
 		reportRemoteProxyResult(rtCfg().ProxyPoolURL, pURL, success)
 		return
 	}
