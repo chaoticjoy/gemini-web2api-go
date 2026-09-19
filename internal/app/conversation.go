@@ -319,13 +319,15 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 				if err != nil {
 					lastErr = fmt.Errorf("建匿名会话失败: %w", err)
 					if pickedOK {
-						recordProxyResult(p.ID, false, lastErr.Error())
+						forceProxyCooldown(p.ID, lastErr.Error())
 					}
 					if proxySwitch < maxProxySwitches {
 						excludedIDs[p.ID] = true
 						if proxyURL != "" {
 							excludedURLs[proxyURL] = true
 						}
+						logf("[conv] 代理 %s (ID %d) 建匿名会话失败，准备切换下一个代理 (第 %d/%d 次切换)...: %v",
+							p.Name, p.ID, proxySwitch+1, maxProxySwitches, lastErr)
 						releaseCurrentSlot()
 						continue
 					}
@@ -343,13 +345,15 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 			} else {
 				lastErr = fmt.Errorf("取 XSRF 失败: %w", err)
 				if pickedOK {
-					recordProxyResult(p.ID, false, lastErr.Error())
+					forceProxyCooldown(p.ID, lastErr.Error())
 				}
 				if proxySwitch < maxProxySwitches {
 					excludedIDs[p.ID] = true
 					if proxyURL != "" {
 						excludedURLs[proxyURL] = true
 					}
+					logf("[conv] 代理 %s (ID %d) 取 XSRF 失败，准备切换下一个代理 (第 %d/%d 次切换)...: %v",
+						p.Name, p.ID, proxySwitch+1, maxProxySwitches, lastErr)
 					releaseCurrentSlot()
 					continue
 				}
@@ -479,6 +483,9 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 			excludedIDs[p.ID] = true
 			if proxyURL != "" {
 				excludedURLs[proxyURL] = true
+			}
+			if pickedOK {
+				forceProxyCooldown(p.ID, lastErr.Error())
 			}
 			logf("[conv] 代理 %s (ID %d) 在 %d 次重试后仍失败，准备切换下一个代理 (第 %d/%d 次切换)...",
 				p.Name, p.ID, rtCfg().RetryAttempts, proxySwitch+1, maxProxySwitches)

@@ -570,7 +570,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			}
 			if uploadFailed {
 				if pickedOK {
-					recordProxyResult(picked.ID, false, lastErr.Error())
+					forceProxyCooldown(picked.ID, lastErr.Error())
 				}
 				if proxySwitch < maxProxySwitches {
 					excludedIDs[picked.ID] = true
@@ -808,6 +808,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			excludedIDs[picked.ID] = true
 			if proxyURL != "" {
 				excludedURLs[proxyURL] = true
+			}
+			if pickedOK {
+				forceProxyCooldown(picked.ID, lastErr.Error())
 			}
 			logf("[proxy] 代理 %s (ID %d) 在 %d 次重试后仍失败，准备切换下一个代理 (第 %d/%d 次切换)...",
 				picked.Name, picked.ID, rtCfg().RetryAttempts, proxySwitch+1, maxProxySwitches)

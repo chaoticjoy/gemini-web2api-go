@@ -108,6 +108,29 @@ func recordDynamicProxyResult(proxyURL string, success bool, errStr string) {
 	}
 }
 
+// forceDynamicProxyCooldown 在动态代理发生不可用错误（如连接拒绝、EOF、建匿名会话失败）或切代理时直接进入熔断冷却
+func forceDynamicProxyCooldown(proxyURL string, errStr string) {
+	if proxyURL == "" {
+		return
+	}
+	dynamicStatsMu.Lock()
+	defer dynamicStatsMu.Unlock()
+
+	now := time.Now().Unix()
+	st, ok := dynamicStats[proxyURL]
+	if !ok {
+		st = &dynamicProxyStat{}
+		dynamicStats[proxyURL] = st
+	}
+	st.lastUsed = now
+	st.failCount = proxyFailThreshold()
+	st.lastError = errStr
+	cooldownMin := rtCfg().ProxyCooldownMin
+	if cooldownMin > 0 {
+		logf("[proxy-dynamic] 动态代理 %s 发生连接故障，直接进入熔断冷却（%d 分钟）: %s", proxyURL, cooldownMin, errStr)
+	}
+}
+
 // isDynamicProxyCooling 判断动态代理是否处于冷却期
 func isDynamicProxyCooling(proxyURL string) bool {
 	if proxyURL == "" {
@@ -490,6 +513,33 @@ func recordProxyResult(id int64, success bool, errStr string) {
 			proxyCache[i].LastError = errStr
 		}
 		break
+	}
+	proxyMu.Unlock()
+}
+
+// forceProxyCooldown 发生致命连接错误（如 SOCKS EOF、TCP 连接拒绝、建会话失败）或触发切代理时直接熔断冷却
+func forceProxyCooldown(id int64, errStr string) {
+	if id == 0 {
+		return
+	}
+	clearStickyProxy()
+	if pURL, isDyn := isDynamicSlot(id); isDyn {
+		forceDynamicProxyCooldown(pURL, errStr)
+		reportRemoteProxyResult(rtCfg().ProxyPoolURL, pURL, false)
+		return
+	}
+	now := time.Now().Unix()
+	threshold := proxyFailThreshold()
+	_, _ = getDB().Exec(`UPDATE proxies SET fail_count=?, last_used=?, last_error=? WHERE id=?`,
+		threshold, now, errStr, id)
+	proxyMu.Lock()
+	for i := range proxyCache {
+		if proxyCache[i].ID == id {
+			proxyCache[i].LastUsed = now
+			proxyCache[i].FailCount = threshold
+			proxyCache[i].LastError = errStr
+			break
+		}
 	}
 	proxyMu.Unlock()
 }
