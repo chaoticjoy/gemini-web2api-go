@@ -430,3 +430,4 @@ func testRemoteProxyPool(poolURL string) (map[string]interface{}, error) {
 	}
 	return result, nil
 }
+
