@@ -1,6 +1,11 @@
 package app
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"io"
+	"testing"
+)
 
 // 连续鉴权失败要自动停用，否则死号会一直排在挑号队列里，
 // 每个请求都得先为它付一次 XSRF 往返才轮到报错。
@@ -87,5 +92,83 @@ func TestUpdateAccountCookieIdentityGuard(t *testing.T) {
 	updateAccountCookie(id, "SAPISID=keep; __Secure-1PSID=other; SIDCC=x")
 	if a := accountByID(id); a == nil || a.Cookie != refreshed {
 		t.Errorf("换了 __Secure-1PSID 应丢弃不写, got cookie=%q", a.Cookie)
+	}
+}
+
+// 取 XSRF 失败只有 cookie 自己的问题才计数。之前任何错误都当 401 记，
+// 断网时 GET /app 连着 3 次 EOF，好号就被自动停用了。
+func TestXSRFErrBlamesCookie(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"无 SNlM0e", fmt.Errorf("no SNlM0e in page (cookie expired or not signed in)"), true},
+		{"401", newAppPageStatusError(401, ""), true},
+		{"403", newAppPageStatusError(403, ""), true},
+		{"302 跳登录", newAppPageStatusError(302, "https://accounts.google.com/ServiceLogin?continue=x"), true},
+		{"302 跳 sorry", newAppPageStatusError(302, "https://www.google.com/sorry/index?continue=x&q=y"), false},
+		{"302 无 Location", newAppPageStatusError(302, ""), false},
+		{"429", newAppPageStatusError(429, ""), false},
+		{"502", newAppPageStatusError(502, ""), false},
+		{"EOF", fmt.Errorf(`Get "https://gemini.google.com/app": %w`, io.EOF), false},
+		{"包一层的 sorry", fmt.Errorf("wrap: %w", newAppPageStatusError(302, "https://www.google.com/sorry/")), false},
+		{"包一层的登录", fmt.Errorf("wrap: %w", newAppPageStatusError(302, "https://accounts.google.com/v3/signin")), true},
+		{"nil", nil, false},
+		{"其它", errors.New("proxy connect failed"), false},
+	}
+	for _, c := range cases {
+		if got := xsrfErrBlamesCookie(c.err); got != c.want {
+			t.Errorf("%s: got %v want %v (err=%v)", c.name, got, c.want, c.err)
+		}
+	}
+}
+
+// 错误文本要保持 "fetch /app: HTTP <code>" 前缀，别处按子串判 "HTTP 302"/"HTTP 429"。
+func TestAppPageStatusErrorText(t *testing.T) {
+	if s := newAppPageStatusError(302, "https://www.google.com/sorry/index?continue=x").Error(); s != "fetch /app: HTTP 302 -> www.google.com/sorry/index" {
+		t.Errorf("got %q", s)
+	}
+	if s := newAppPageStatusError(429, "").Error(); s != "fetch /app: HTTP 429" {
+		t.Errorf("got %q", s)
+	}
+}
+
+// 跳 /sorry 也是 302，文案不能说成「重定向到登录页」。
+func TestExplainCookieFailureSorry(t *testing.T) {
+	got := explainCookieFailure(newAppPageStatusError(302, "https://www.google.com/sorry/index"))
+	if got != "出口被上游限流，换个代理再试（不是 cookie 的问题）" {
+		t.Errorf("sorry 302: got %q", got)
+	}
+	got = explainCookieFailure(newAppPageStatusError(302, "https://accounts.google.com/ServiceLogin"))
+	if got != "cookie 无效：被重定向到登录页" {
+		t.Errorf("login 302: got %q", got)
+	}
+}
+
+// 账号序号要能存能读，越界要拒。
+func TestAccountAuthUser(t *testing.T) {
+	id, err := accountAdd("multi", "SAPISID=ggg; __Secure-1PSID=hhh", "")
+	if err != nil {
+		t.Fatalf("插账号失败: %v", err)
+	}
+	t.Cleanup(func() { _ = accountDelete(id) })
+
+	if a := accountByID(id); a == nil || a.AuthUser != 0 {
+		t.Fatalf("默认序号应为 0, got %+v", a)
+	}
+	if err := accountSetAuthUser(id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if a := accountByID(id); a == nil || a.AuthUser != 1 {
+		t.Errorf("序号应为 1, got %+v", a)
+	}
+	for _, bad := range []int{-1, maxAuthUser + 1} {
+		if err := accountSetAuthUser(id, bad); err == nil {
+			t.Errorf("序号 %d 应被拒", bad)
+		}
+	}
+	if a := accountByID(id); a == nil || a.AuthUser != 1 {
+		t.Errorf("被拒后应保持 1, got %+v", a)
 	}
 }

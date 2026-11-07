@@ -40,7 +40,7 @@ func resolveProfile(name string) profiles.ClientProfile {
 		return profiles.Firefox_120
 	case "firefox_123":
 		return profiles.Firefox_123
-	case "firefox_147", "firefox147":
+	case "firefox", "firefox_147", "firefox147", "firefox_157", "zen":
 		return profiles.Firefox_147
 	case "safari_16_0":
 		return profiles.Safari_16_0
@@ -51,12 +51,18 @@ func resolveProfile(name string) profiles.ClientProfile {
 	}
 }
 
-// getTLSClient returns a tls-client (Chrome 146 fingerprint) for direct connections only.
+// getTLSClient returns a tls-client for direct connections only; its fingerprint follows
+// effectiveImpersonate() (default Chrome 146, Firefox_147 when the firefox toggle is on).
 // For proxied connections we use stdlib (see getStdlibClient) — tls-client's SOCKS5
 // implementation is fragile compared to net/http.
 func getTLSClient() tls_client.HttpClient {
+	imp := effectiveImpersonate()
+	// 缓存 key 带上超时：超时是建客户端时定死的，面板改了 request_timeout_sec
+	// 要换一个新客户端才生效（只按 imp 缓存时要重启进程才生效）。
+	timeout := rtCfg().RequestTimeout
+	key := fmt.Sprintf("%s|%d", imp, timeout)
 	clientCacheMu.RLock()
-	if c, ok := clientCache[rtCfg().Impersonate]; ok {
+	if c, ok := clientCache[key]; ok {
 		clientCacheMu.RUnlock()
 		return c
 	}
@@ -64,12 +70,12 @@ func getTLSClient() tls_client.HttpClient {
 
 	clientCacheMu.Lock()
 	defer clientCacheMu.Unlock()
-	if c, ok := clientCache[rtCfg().Impersonate]; ok {
+	if c, ok := clientCache[key]; ok {
 		return c
 	}
 	opts := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(rtCfg().RequestTimeout),
-		tls_client.WithClientProfile(resolveProfile(rtCfg().Impersonate)),
+		tls_client.WithTimeoutSeconds(timeout),
+		tls_client.WithClientProfile(resolveProfile(imp)),
 		tls_client.WithNotFollowRedirects(),
 	}
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), opts...)
@@ -77,7 +83,7 @@ func getTLSClient() tls_client.HttpClient {
 		fmt.Fprintf(os.Stderr, "[client] tls-client init failed: %v\n", err)
 		os.Exit(1)
 	}
-	clientCache[rtCfg().Impersonate] = client
+	clientCache[key] = client
 	return client
 }
 
@@ -100,13 +106,16 @@ func getTLSClient() tls_client.HttpClient {
 // 不走代理时仍然用 getTLSClient（保留 utls/chrome146 真指纹优势）。
 
 var (
-	stdlibClientCache sync.Map // proxyURL -> *http.Client
+	stdlibClientCache sync.Map // proxyURL|超时秒数 -> *http.Client
 )
 
 // getStdlibClient returns an http.Client routed through proxyURL.
 // proxyURL must not be empty (caller checks).
 func getStdlibClient(proxyURL string) *http.Client {
-	if cached, ok := stdlibClientCache.Load(proxyURL); ok {
+	// 同 getTLSClient：超时进 key，面板改超时后换新客户端。
+	timeout := rtCfg().RequestTimeout
+	key := fmt.Sprintf("%s|%d", proxyURL, timeout)
+	if cached, ok := stdlibClientCache.Load(key); ok {
 		return cached.(*http.Client)
 	}
 	t := &http.Transport{
@@ -121,14 +130,14 @@ func getStdlibClient(proxyURL string) *http.Client {
 		t.Proxy = http.ProxyURL(u)
 	}
 	c := &http.Client{
-		Timeout:   time.Duration(rtCfg().RequestTimeout) * time.Second,
+		Timeout:   time.Duration(timeout) * time.Second,
 		Transport: t,
 		// 跟 tls-client 一致：不自动跟随重定向（302 是诊断信号）
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	stdlibClientCache.Store(proxyURL, c)
+	stdlibClientCache.Store(key, c)
 	return c
 }
 
@@ -157,9 +166,57 @@ func makeSAPISIDHash(sapisid string) string {
 // ChromeUA 是给 stdlib 走代理时用的 Chrome 146 真实 UA 模板。
 const ChromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
-// applyChromeHeaders 给 stdlib 请求填上模拟 Chrome 146 的应用层 header。
-// utls 那层做 TLS/HTTP2 指纹我们做不到（走代理），但 header 一定要齐。
+// FirefoxUA 是走 Firefox/Zen 指纹时的 UA 模板。版本号对齐底层 TLS profile（tls-client 的
+// Firefox_147），不报更高的 157——UA 报的大版本跟 TLS 握手指纹对不上反而更可疑。
+const FirefoxUA = "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0"
+
+// isFirefoxProfile 判断这次该不该走 Firefox 指纹。两个来源，任一成立即是：
+//  1. firefox_fingerprint 实验开关打开（设置页里显式 opt-in，见 config.go）；
+//  2. impersonate 字符串本身就填成了 firefox*/zen（老用法，向后兼容）。
+//
+// TLS profile（getTLSClient→effectiveImpersonate）和应用层 header（applyBrowserHeaders）
+// 认的是同一个判据，两层不会错位成「Firefox UA + Chrome 握手」。
+func isFirefoxProfile() bool {
+	if rtCfg().FirefoxFingerprint {
+		return true
+	}
+	p := strings.ToLower(rtCfg().Impersonate)
+	return strings.HasPrefix(p, "firefox") || p == "zen"
+}
+
+// effectiveImpersonate 是真正拿去 resolveProfile 的指纹名。开着 Firefox 实验开关时强制
+// firefox_147（跟 FirefoxUA 的大版本对齐），否则用用户配的 impersonate（默认 chrome_146）。
+func effectiveImpersonate() string {
+	if rtCfg().FirefoxFingerprint {
+		return "firefox_147"
+	}
+	return rtCfg().Impersonate
+}
+
+func currentBrowserUA() string {
+	if isFirefoxProfile() {
+		return FirefoxUA
+	}
+	return ChromeUA
+}
+
+// applyChromeHeaders 给 stdlib 请求填上应用层 header（根据 impersonate 配置自动适配 Chrome 或 Firefox）。
 func applyChromeHeaders(req *http.Request) {
+	applyBrowserHeaders(req)
+}
+
+// applyBrowserHeaders 给 stdlib 请求填上对应 impersonate 配置的应用层 header。
+func applyBrowserHeaders(req *http.Request) {
+	if isFirefoxProfile() {
+		req.Header.Set("User-Agent", FirefoxUA)
+		req.Header.Del("Sec-CH-UA")
+		req.Header.Del("Sec-CH-UA-Mobile")
+		req.Header.Del("Sec-CH-UA-Platform")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		return
+	}
 	req.Header.Set("User-Agent", ChromeUA)
 	req.Header.Set("Sec-CH-UA", `"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"`)
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")

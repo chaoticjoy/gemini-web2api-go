@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,7 +10,7 @@ import (
 	"time"
 )
 
-const Version = "4.20.1"
+const Version = "4.27.1"
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	body, _ := json.Marshal(data)
@@ -154,11 +155,11 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 	// 只有文字没有图的半成品 —— 客户端要的就是那张图/那段乐。
 	if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
 		if len(res.Artifacts) == 0 {
-			msg := res.MediaErr
-			if msg == "" {
-				msg = "媒体产物取回失败"
+			cause := res.MediaErr
+			if cause == nil {
+				cause = errors.New("媒体产物取回失败")
 			}
-			return "", nil, res, fmt.Errorf("media generation succeeded but artifact retrieval failed: %s", msg)
+			return "", nil, res, fmt.Errorf("media generation succeeded but artifact retrieval failed: %w", cause)
 		}
 		// 产物以 base64 data URL 追加到正文（可能没正文，只有图/乐/视频）。
 		text = appendArtifactMarkdown(text, res.Artifacts)
@@ -330,9 +331,18 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
 	}
 	if err != nil {
-		recordRequest("chat.completions", modelName, prompt, "", res, 502, err.Error(), stream)
+		mde, downgraded := err.(*ModelDowngradedError)
+		status := 502
+		if downgraded {
+			status = 429
+		}
+		recordRequest("chat.completions", modelName, prompt, "", res, status, err.Error(), stream)
 		if sse != nil && sse.Started() {
 			sse.Fail(err) // 已经开流，HTTP 状态码改不了了
+			return
+		}
+		if downgraded {
+			writeModelDowngraded(w, mde)
 			return
 		}
 		if ptl, ok := err.(*PromptTooLongError); ok {
@@ -685,8 +695,17 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, nil)
 	}
 	if err != nil {
-		recordRequest("responses", modelName, prompt, "", res, 502, err.Error(), stream)
+		mde, downgraded := err.(*ModelDowngradedError)
+		status := 502
+		if downgraded {
+			status = 429
+		}
+		recordRequest("responses", modelName, prompt, "", res, status, err.Error(), stream)
 		if stream {
+			errObj := map[string]string{"message": err.Error()}
+			if downgraded {
+				errObj["code"] = "model_downgraded"
+			}
 			writeEvent("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
@@ -694,9 +713,13 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 					"object": "response",
 					"status": "failed",
 					"model":  modelName,
-					"error":  map[string]string{"message": err.Error()},
+					"error":  errObj,
 				},
 			})
+			return
+		}
+		if downgraded {
+			writeModelDowngraded(w, mde)
 			return
 		}
 		if ptl, ok := err.(*PromptTooLongError); ok {

@@ -4,8 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -320,11 +323,11 @@ func (g *toolFenceGate) Push(delta string) {
 	g.buf += delta
 	for {
 		if g.inFence {
-			j := strings.Index(g.buf, toolFenceClose)
-			if j < 0 {
+			_, next, ok := toolFenceEnd(g.buf, false)
+			if !ok {
 				return // 围栏还没闭合，整段扣住
 			}
-			g.buf = g.buf[j+len(toolFenceClose):]
+			g.buf = g.buf[next:]
 			g.inFence = false
 			continue
 		}
@@ -358,38 +361,154 @@ func partialPrefixLen(s, marker string) int {
 	return 0
 }
 
-// 放宽：围栏内不强求前后换行——模型有时吐 ```tool_call\n{...}\n```、有时
-// ```tool_call {...}``` 甚至一行内。老正则死磕 \n…\n，格式一变就漏解析，漏了就把
-// 整个 ```tool_call``` 块当正文发给客户端 = 用户看到的「已读乱回」。这里只认围栏、
-// 内容交给 JSON 解析兜底（非围栏内容里不会有 ```，非贪婪停在第一个闭合围栏）。
-var toolCallRe = regexp.MustCompile("(?s)```tool_call(.*?)```")
+// toolFenceEnd 在开围栏之后的文本 s 里找闭合围栏：body 是围栏体的长度，next 是
+// 闭合围栏之后的位置。ok=false 表示还判定不了（流式时等下一帧）或者没闭合。
+//
+// 闭合判据：先按 JSON 解析出围栏体里的一个完整值，它后面的第一个 ``` 才是闭合围栏。
+// 不能直接找第一个 ```：写代码类工具的参数里常带 markdown 代码块，JSON 字符串里的
+// ``` 是原样出现的，按第一个算会把调用截成半截 JSON，后半截漏给客户端。
+//
+// JSON 写坏了（语法错）退回「第一个 ```」。JSON 没写完：流式时等，final 时同样退回
+// 第一个 ```。JSON 语法错在出错的那个字符到达时就能判定，所以流式和 final 对同一份
+// 文本给出同一个闭合位置，闸门已发的内容始终是最终文本的前缀。
+func toolFenceEnd(s string, final bool) (body, next int, ok bool) {
+	from := 0
+	dec := json.NewDecoder(strings.NewReader(s))
+	var v json.RawMessage
+	err := dec.Decode(&v)
+	switch {
+	case err == nil:
+		off := int(dec.InputOffset())
+		rest := strings.TrimLeft(s[off:], " \t\r\n")
+		if strings.HasPrefix(rest, toolFenceClose) {
+			body = len(s) - len(rest)
+			return body, body + len(toolFenceClose), true
+		}
+		if !final && strings.HasPrefix(toolFenceClose, rest) {
+			return 0, 0, false
+		}
+		from = off
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		if !final {
+			return 0, 0, false
+		}
+	}
+	j := strings.Index(s[from:], toolFenceClose)
+	if j < 0 {
+		return 0, 0, false
+	}
+	return from + j, from + j + len(toolFenceClose), true
+}
 
 // parseToolCalls extracts ```tool_call``` blocks. Returns clean text + tool_calls.
+//
+// 围栏内不强求前后换行——模型有时吐 ```tool_call\n{...}\n```、有时一行内；内容交给
+// JSON 解析。闭合位置见 toolFenceEnd。解析不出的围栏也从正文里去掉，未闭合的原样留下。
 func parseToolCalls(text string) (string, []ToolCall) {
 	var toolCalls []ToolCall
-	for _, match := range toolCallRe.FindAllStringSubmatch(text, -1) {
-		if len(match) < 2 {
+	var clean strings.Builder
+	rest := text
+	for {
+		i := strings.Index(rest, toolFenceOpen)
+		if i < 0 {
+			break
+		}
+		after := rest[i+len(toolFenceOpen):]
+		body, next, ok := toolFenceEnd(after, true)
+		if !ok {
+			break
+		}
+		clean.WriteString(rest[:i])
+		rest = after[next:]
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(after[:body])), &raw); err != nil || raw == nil {
 			continue
 		}
-		var data struct {
-			Name      string                 `json:"name"`
-			Arguments map[string]interface{} `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(match[1])), &data); err != nil {
+		name := toolCallName(raw)
+		if name == "" {
 			continue
 		}
-		argsJSON, _ := json.Marshal(data.Arguments)
 		toolCalls = append(toolCalls, ToolCall{
 			ID:   "call_" + randHex(8),
 			Type: "function",
 			Function: ToolCallFunction{
-				Name:      data.Name,
-				Arguments: string(argsJSON),
+				Name:      name,
+				Arguments: toolCallArgs(raw),
 			},
 		})
 	}
-	clean := toolCallRe.ReplaceAllString(text, "")
-	return strings.TrimSpace(clean), toolCalls
+	clean.WriteString(rest)
+	return strings.TrimSpace(clean.String()), toolCalls
+}
+
+// toolCallNameKeys 是模型写工具名时用过的键。
+var toolCallNameKeys = []string{"name", "tool", "tool_name", "function_name"}
+
+// toolCallArgKeys 是模型写参数时用过的容器键，按优先级排：有多个时只取第一个能用的，不合并。
+var toolCallArgKeys = []string{"arguments", "parameters", "input", "args"}
+
+// toolCallMetaKeys 是平铺兜底时要跳过的非参数键。
+var toolCallMetaKeys = []string{"function", "type", "id", "thought"}
+
+// toolCallName 取围栏里的工具名，也认 {"function":{"name":…}} 嵌套。取不到返回空串。
+func toolCallName(raw map[string]interface{}) string {
+	for _, k := range toolCallNameKeys {
+		if s, ok := raw[k].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	if fn, ok := raw["function"].(map[string]interface{}); ok {
+		if s, ok := fn["name"].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+// toolCallArgs 把围栏里的参数整理成 JSON 对象字符串，保证不是 "null"（OpenAI 客户端只收对象）。
+// 依次认：容器键里的对象、容器键里二次编码的对象字符串、平铺在顶层的其余键；都没有给 "{}"。
+func toolCallArgs(raw map[string]interface{}) string {
+	if fn, ok := raw["function"].(map[string]interface{}); ok {
+		if a, ok := argsObject(fn["arguments"]); ok {
+			return a
+		}
+	}
+	for _, k := range toolCallArgKeys {
+		if a, ok := argsObject(raw[k]); ok {
+			return a
+		}
+	}
+	flat := map[string]interface{}{}
+	for k, v := range raw {
+		if slices.Contains(toolCallNameKeys, k) || slices.Contains(toolCallArgKeys, k) || slices.Contains(toolCallMetaKeys, k) {
+			continue
+		}
+		flat[k] = v
+	}
+	if b, err := json.Marshal(flat); err == nil {
+		return string(b)
+	}
+	return "{}"
+}
+
+// argsObject 接受对象，或内容是 JSON 对象的字符串；缺失、null、数组、标量都返回 false。
+func argsObject(v interface{}) (string, bool) {
+	var m map[string]interface{}
+	switch t := v.(type) {
+	case map[string]interface{}:
+		m = t
+	case string:
+		if json.Unmarshal([]byte(strings.TrimSpace(t)), &m) != nil || m == nil {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
 }
 
 // parseToolChoice 解析 OpenAI 的 tool_choice。

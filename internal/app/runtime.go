@@ -62,6 +62,23 @@ type RuntimeConfig struct {
 	// 匿名优先（#20）：不需要登录态能力的请求（纯文本、非思考、无工具、无图）走匿名、
 	// 不占 cookie 账号，省账号额度；需要登录才挑号。默认 false，见 modelNeedsLogin。
 	AnonFirst bool `json:"anon_first"`
+	// 临时对话（#34）：塞 inner[45]=1，走网页端原生「临时对话」——不进会话列表、不入训练，
+	// 取代 auto_delete_conversation（省掉删除 RPC）。只登录态有意义，与 multi_turn 冲突
+	// （multi_turn 开着时不发）。默认 false，见 temporaryChatEligible。
+	TemporaryChat bool `json:"temporary_chat"`
+	// 生成图放大（#62）：出图后发 rpc c8o8Fe 取网页「下载原图」那张放大版。要登录态；
+	// 失败退回原图、不重新生成。默认 false，见 image_upscale.go。
+	ImageUpscale bool `json:"image_upscale"`
+	// 新协议（#43）：对话走 processSession，见 webchannel.go。默认 false。
+	WebChannel bool `json:"web_channel"`
+	// FirefoxFingerprint 实验开关（#40 之上）：开 → 强制 Firefox/Zen 指纹（TLS Firefox_147 +
+	// Firefox UA + 去 Sec-CH-UA）；关 → 用 Impersonate（默认 Chrome）。直连才是完整 Firefox
+	// 指纹，走代理时 TLS 仍是 Go 标准库的。默认 false。见 isFirefoxProfile / effectiveImpersonate。
+	FirefoxFingerprint bool `json:"firefox_fingerprint"`
+	// 严格模型校验（#41）：自报模型 ≠ 请求模型时换号重试，全池降级回 429。默认 false。
+	StrictModel bool `json:"strict_model"`
+	// 被降级的号在该模型上冷却多久（分钟），0 = 不记。默认 300（用量窗口 5 小时）。
+	StrictModelCooldownMin int `json:"strict_model_cooldown_min"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -101,6 +118,12 @@ func initRuntimeConfig() {
 
 		AutoDeleteConversation: cfg.AutoDeleteConversation,
 		AnonFirst:              cfg.AnonFirst,
+		TemporaryChat:          cfg.TemporaryChat,
+		ImageUpscale:           cfg.ImageUpscale,
+		WebChannel:             cfg.WebChannel,
+		FirefoxFingerprint:     cfg.FirefoxFingerprint,
+		StrictModel:            cfg.StrictModel,
+		StrictModelCooldownMin: cfg.StrictModelCooldownMin,
 	}
 	if base.ProxyMode == "" {
 		base.ProxyMode = "auto"
@@ -152,6 +175,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		{"retention_days", c.RetentionDays, 1, 3650},
 		{"proxy_cooldown_min", c.ProxyCooldownMin, 0, 10080},
 		{"max_prompt_bytes", c.MaxPromptBytes, 0, 10000000},
+		{"strict_model_cooldown_min", c.StrictModelCooldownMin, 0, 10080},
 	} {
 		if r.v < r.min || r.v > r.max {
 			return fmt.Errorf("%s=%d 超出允许范围 [%d, %d]", r.name, r.v, r.min, r.max)

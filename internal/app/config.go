@@ -51,6 +51,27 @@ type Config struct {
 	// 匿名优先（#20）：这次请求不需要登录态能力（纯文本、非思考、无工具、无图）时
 	// 不占用 cookie 账号，走匿名省额度；需要登录才挑号。默认 false。见 modelNeedsLogin。
 	AnonFirst bool `json:"anon_first"`
+	// 临时对话（#34）：发请求时塞 inner[45]=1，走 Gemini 网页端原生「临时对话」——
+	// 会话不进账号的会话列表、不用于训练，天然取代 auto_delete_conversation（无需再发删除
+	// RPC）。只登录态有意义（匿名本就不落账号）。与 multi_turn 冲突：multi_turn 开着时不发，
+	// 见 temporaryChatEligible。默认 false。
+	TemporaryChat bool `json:"temporary_chat"`
+	// 生成图放大（#62）：出图后照网页「下载原图」那样发 rpc c8o8Fe，返回放大版（实测宽高各
+	// 2 倍、JPEG）。要登录态；放大失败退回原来那张，不重新生成。默认 false。
+	ImageUpscale bool `json:"image_upscale"`
+	// 新协议（#43）：对话改走 processSession（WebChannel）而不是老的 StreamGenerate。后端是同一个，
+	// 只换传输层；老端点还能用，默认 false。多轮续接仍走老端点，见 webchannel.go。
+	WebChannel bool `json:"web_channel"`
+	// FirefoxFingerprint 是「浏览器指纹」实验开关（#40 之上）：开 → 强制走 Firefox/Zen 指纹
+	// （TLS profile Firefox_147 + Firefox UA + 去掉 Chromium 专有的 Sec-CH-UA）；关 → 用
+	// Impersonate（默认 Chrome）。直连才是完整 Firefox 指纹，走代理时 TLS 这层仍是 Go 标准库
+	// 的（隧道限制，改不了）。默认 false。见 client.go 的 isFirefoxProfile / effectiveImpersonate。
+	FirefoxFingerprint bool `json:"firefox_fingerprint"`
+	// 严格模型校验（#41）：服务端自报的模型跟请求的不一致（额度用完被静默降级）时
+	// 不把降级回答当成功，换号重试，全池降级就回 429。默认 false。见 strict_model.go。
+	StrictModel bool `json:"strict_model"`
+	// 被降级的号在该模型上冷却多久（分钟），0 = 不记。网页端用量按 5 小时滚动窗算，默认 300。
+	StrictModelCooldownMin int `json:"strict_model_cooldown_min"`
 }
 
 var (
@@ -66,7 +87,7 @@ func defaultConfig() Config {
 		RetryDelaySec:      2,
 		ProxyRetryAttempts: 2,
 		RequestTimeout:     180,
-		GeminiBL:       "boq_assistant-bard-web-server_20260525.09_p0",
+		GeminiBL:       "boq_gemini-web-uiserver_20261007.01_p0",
 		DefaultModel:   "gemini-3.6-flash",
 		LogRequests:    true,
 		CookieFile:     "",
@@ -96,6 +117,12 @@ func defaultConfig() Config {
 		MultiTurn:              false,
 		AutoDeleteConversation: false,
 		AnonFirst:              false,
+		TemporaryChat:          false,
+		ImageUpscale:           false,
+		WebChannel:             false,
+		FirefoxFingerprint:     false,
+		StrictModel:            false,
+		StrictModelCooldownMin: 300,
 	}
 }
 

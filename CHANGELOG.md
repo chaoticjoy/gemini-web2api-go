@@ -2,6 +2,183 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 4.27.1
+
+### 修复
+
+- **回答偶尔是一句固定的出错话术（#68）**。上游有时回 HTTP 200，正文却是「I seem to be encountering an error…」
+  「Sorry, something went wrong…」「我只是一个语言模型…」这类固定句子，之前被当正常回答返回。这是上游偶发失败，
+  跟账号、模型、新老协议都无关；现在能识别出来并自动重试，流式在吐字之前就拦下。多轮续接（`multi_turn`）也一样。
+- **工具调用的参数变成 `null`（#69）**。模型没写 `arguments`、把参数写在 `parameters` / `input` 里或平铺在外层、
+  或者把参数写成一段 JSON 字符串时，之前会发出 `"arguments": "null"`（客户端报「must be a JSON object」中断），
+  或者整个调用被丢掉、只剩正文。现在参数一律整理成 JSON 对象，取不到就给 `{}`；没写工具名的调用不再发出。
+  `/v1beta` 原生接口的 `functionCall.args` 随之修好。
+- **回答里夹着 `<ElicitationsGroup>`、`<Sequence>`、`<Carousel>` 等标签**。上游近期开始在正文里直接写网页端的
+  卡片组件，匿名和登录态都有。现在转成 Markdown：步骤卡片变成带序号的小标题，视频轮播变成视频链接列表，
+  清单变成任务列表，追问建议变成列表。流式同样处理，代码块里的标签不动。
+- **生图回复里多一行打不开的 `http://googleusercontent.com/image_generation_content/0_N`**。这是网页上放图片的占位，
+  现在去掉了，图片照旧附在末尾。
+
+## 4.27.0
+
+### 新增
+
+- **多账号登录的「账号序号」（#59）**。同一个浏览器里登了多个 Google 号时，导出的那串 cookie 能当其中任何一个号用，
+  选哪个号由请求地址决定；之前一律落在默认号上，订阅在别的号上时付费模型会被静默降级成 3.5 Flash-Lite，
+  「检测」却显示有效。现在 Cookie 池每条可以填「账号序号」（那个号的 Gemini 地址栏 `/u/1/` 就填 1），
+  对话、看图和长文本附件的上传、生图/音乐/视频的产物下载、会话列表/删除都会落到这个号上。同一串 cookie 可以导入多次、
+  各填各的序号，当几个号用。管理接口 `POST/PATCH /admin/api/cookies` 新增 `authuser` 字段。
+- **生图下载原图 / 放大（#62）**。新开关 `image_upscale`（面板「设置」→「生图下载原图/放大」，默认关）。
+  打开后生成的图照网页「下载」按钮那样取：Ultra 号的图放大到宽高各 2 倍（1376×768 → 2752×1536），
+  普通号拿到未重新压缩的原始文件（尺寸不变，约 0.8MB，默认那张约 0.2MB）。取不到就退回默认那张，不重新生成。
+- **新协议 processSession（#43）**。新开关 `web_channel`（面板「设置」→「新协议（processSession）」，默认关）。
+  打开后对话改走网页新版用的 WebChannel 接口，而不是老的 StreamGenerate；后端是同一个，只换传输方式。
+  老接口目前仍正常，留作老接口出问题时的备用。文本（流式/非流式）、看图、生图、匿名已实测；多轮续接仍走老接口；
+  扩展思考在新协议上暂时不生效。
+
+### 修复
+
+- **断网时好号被自动停用**。取登录 token 时的网络错误（如 EOF）被当成鉴权失败计数，连续 3 次就把账号停掉。
+  现在只有确实是 cookie 的问题（页面没有登录态、401/403、被跳到登录页）才计数；断网、被 Google 拦（跳 `/sorry`）、
+  429、5xx 都不算。
+- **工具调用的参数里带 ``` 时被截断（#65）**。写文件这类工具的参数里常有 markdown 代码块，之前遇到第一个 ```
+  就当围栏结束：这次调用整个丢掉，参数后半截被当正文发出去。现在按 JSON 解析完整个调用再找闭合围栏，流式和非流式都改了。
+- **代理池全部熔断时报成「RPH 已满」（PR #61，@Guuuu233）**。现在报 `proxy_unavailable`（HTTP 502），
+  不再误导人去调高限额；真正的并发/频率限制仍回 429。
+- 面板「检测」遇到出口被 Google 拦（跳 `/sorry`）时，不再显示成「cookie 无效：被重定向到登录页」。
+- 视频配额页只在确实是登录态问题时才显示 `not signed in`，断网或代理不可用时显示原始错误。
+
+## 4.26.0
+
+### 新增
+
+- **面板「关于」页和检查更新**。显示当前 / 最新版本，有新版本时顶栏出现提示，「关于」页给出更新说明、
+  Docker 更新命令和各平台二进制下载链接。由浏览器直接查询 GitHub，服务端不发任何请求；结果缓存 6 小时，
+  可在「关于」页关掉自动检查。顶栏新增 GitHub 入口。
+
+### 改进
+
+- **设置页排版**。开关类选项单独成行（开关在左、说明在右），不再挤在输入框的多列网格里；复选框换成
+  开关样式；「请求行为」里的会话相关开关拆成「会话与账号」一组。
+
+## 4.25.0
+
+### 新增
+
+- **Google 原生 Gemini API 接口（#58）**。同一端口新增 `POST /v1beta/models/{model}:generateContent`、
+  `:streamGenerateContent`（真流式；`?alt=sse` 回 SSE，不带回 JSON 数组）、`:countTokens`，以及
+  `GET /v1beta/models`。给只说 Google 格式的客户端用：`google-genai` SDK、Bifrost 等网关的 Google provider。
+  - 支持 function calling：`tools[].functionDeclarations`、`toolConfig.functionCallingConfig`（`AUTO` / `ANY` /
+    `NONE`、`allowedFunctionNames`）、历史里的 `functionCall` / `functionResponse`；模型的调用以 `functionCall`
+    part 返回，SDK 的自动函数调用可用。底下跟 OpenAI 接口同一套 prompt 级实现。
+  - `thinkingConfig.includeThoughts` 时思考摘要以 `thought` part 返回；生图 / 音乐产物以 `inlineData` 返回；
+    `inlineData` / http(s) `fileData` 的图片和视频作为输入（需要 cookie）。
+  - 错误体用 Google 的 `{"error":{code,message,status}}` 形状，状态码跟 OpenAI 接口一致。
+  - 模型名用本项目的（`gemini-3.6-flash` 等）。
+- **API key 也认 `x-goog-api-key` 头和 `?key=` 参数**（Google SDK 的带法），原有的 `Authorization: Bearer` /
+  `x-api-key` 不变。
+
+## 4.24.1
+
+### 修复
+
+- **面板改 `request_timeout_sec` 不重启就不生效（#55）**。HTTP 客户端在创建时把超时定死并缓存，
+  保存设置后新请求仍用旧超时（比如面板显示 180，实际还按之前的 20 秒断开，日志是
+  `Client.Timeout` / `context deadline exceeded`）。现在改完立刻生效，跟面板的说明一致。
+
+## 4.24.0
+
+### 新增
+
+- **`strict_model`：上游静默降级时不当成功返回（#41 / #45 / #56）**。付费模型（3.1 Pro / 4 Argon 等）
+  额度用完或号没权限时，Google 不报错，而是静默换成 3.5 Flash-Lite 照样回 200。开关打开后，服务端
+  自报的显示名跟请求的模型对不上就在第一个字发出前掐断，换池子里下一个号重试；全池都被降级时回
+  `429 insufficient_quota`（`code: model_downgraded`，带 `Retry-After`）。被降级的号按（账号, 模型）冷却
+  `strict_model_cooldown_min` 分钟，不影响它跑别的模型。默认关，面板「设置」可开。
+  - 判据：只看帧里的显示名（整词前缀比较，兼容 `High` / `扩展` 等思考档后缀）。帧里的模型 hex 现在
+    一律是 `cf41b0e0dd7d53e5`，不管请求哪个模型，已不能用来判断。
+- **`/v1/videos` 图生视频、竖屏、续写（PR #50，@ape1121）**。`input_reference` 首帧（data / http(s) URL、
+  `{"image_url": …}` 或 multipart 文件）；`size` `720x1280` / `aspect_ratio` `9:16`；
+  `POST /v1/videos/{id}/extend` 在原会话里续写，返回加长后的完整 MP4（需要 `temporary_chat` 和
+  `auto_delete_conversation` 都关着，否则回 409）。
+- **视频额度用完自动换号 + `GET /admin/api/video-quota`（PR #51，@ape1121）**。额度被拒的号冷却到
+  Google 写在拒绝里的重置时间（没写按 1 小时），同一任务里换下一个号；全池都在冷却时
+  `POST /v1/videos` 回 `429 video_quota_exhausted` + `Retry-After`。统计接口读各号自己的会话历史，
+  所有上游请求过代理池和限流器。
+- **MCP 媒体工具（#54）**。`/mcp` 新增 `generate_image`（可带参考图）、`generate_music`、
+  `create_video_task` / `get_video_status`。产物用 MCP 原生的 `image` / `audio` / embedded resource
+  内容返回，不把 base64 写进文本；视频默认只回状态，`include_video=true` 才附 MP4。
+
+### 修复
+
+- **一次 `/v1/videos` 请求生成了 3 个视频（#50 / #55）**。视频提交的受理响应本来就没有内容帧，旧代码
+  把它当空响应重试了 3 次。现在受理帧算提交成功。
+- **视频下载挑到放不了的封装包（#50）**。以前多份下载链里挑最大的那份，现在挑真正的 MP4。
+- **视频额度用完 / 被文字拒绝时干等约 6 分钟（#50）**。现在立即失败，错误带 `video_quota_exhausted`
+  或 `video_refused: <Gemini 的回复>`。
+
+## 4.23.0
+
+### 新增
+
+- **`gemini-4-argon-thinking-medium`——4 Argon 中档思考（延续 #35）**。思考档从 bool 扩成可显式
+  指定线值（低=1 / 高=2 / 中=4，`ModelConfig.ThinkWire`）。中档在服务端内部完成、响应不带思考链，
+  故不映射 `reasoning_content`；登录门控同 Argon（付费 / Ultra 号 cookie）。
+  - 判据：2026-10-19 processSession 抓包里选中档时 think 槽（新协议字段 #81 = 老 `inner[80]`）发的
+    就是 4；现有模型取值逐字不变（argon=1 / argon-thinking=2 / flash=1、2），`buildModelHeader` 输出逐个核对。
+
+- **浏览器指纹实验开关 `firefox_fingerprint`（PR #40 之上）**。开 → 强制 Firefox/Zen 指纹（TLS profile
+  Firefox_147 + Firefox UA + 去掉 Chromium 专有的 `Sec-CH-UA`）；关 → 用 `impersonate`（默认 Chrome）。
+  直连才是完整 Firefox 指纹，走代理时 TLS 这层仍是 Go 标准库的（HTTP CONNECT 隧道限制）。面板「设置」
+  可开关，默认关。合入 #40 的应用层 header / UA 对齐。
+
+- **管理面板英文 i18n（PR #38）**。面板页面、弹窗、后端错误信息补齐英文。
+
+### 文档
+
+- README / README_EN 加目录（首屏二级标题锚点跳转）、「能用 Gemini 4 Argon 吗？怎么用？」FAQ、首屏
+  定义句补 4 Argon、快速开始末尾 star 引导、文末 Star History。
+
+## 4.22.0
+
+### 新增
+
+- **`gemini-4-argon` / `gemini-4-argon-thinking`（issue #35 / #36）**。接入 Gemini 网页端
+  「4 Argon」（otAQ7b 清单主 hex `95a4c0abcba24364`、代号 `Argon4p0`、desc「复杂任务」）。
+  付费 / Ultra 账号专属，免费号发它被静默降级成 3.5 Flash-Lite，故没 cookie 时不暴露、
+  也不走匿名。`-thinking` 版带 `reasoning_content`。
+  - 判据：拿一个 Ultra 号端到端实测，真正选中 Argon 的是 **MODE=8**（`x-goog-ext-525001261-jspb`
+    下标 14 / `inner[79]`）而不是 hex——单变量对照：hex=Argon 配 mode=1 回报「3.8 Flash」、
+    hex=Argon 配 mode=8 回报「4 Argon」、hex=3.8Flash 配 mode=8 也回报「4 Argon」（mode 决定、
+    hex 被忽略）。issue #35 给的 hex 没错，但只填 hex 不填对 mode 会落到 3.8 Flash。
+  - `-thinking`：mode=8 + `inner[80]=2`（上游把这档显示成 `High`）实测回报「4 Argon High」，
+    硬题下带 985 字符思考链，走既有 `[4][0][37][0][0]` 抽取路径，无需改代码即映射成
+    `reasoning_content`；同次对照 3.1 Pro 也回报「3.1 Pro High」（扩展思考后缀上游统一改叫
+    `High`，仅显示名变、抽取不变）。
+
+## 4.21.0
+
+### 新增
+
+- **临时对话 `temporary_chat`（issue #34）**。开启后发请求塞 `inner[45]=1`，走 Gemini 网页端
+  原生「临时对话」：会话压根不进账号的会话列表、不用于模型训练，比 #19 的「自动删会话」
+  （`auto_delete_conversation`）更干净——根本不建、不用删，顺带省掉那次 `GzXR5e` 删除请求。
+  只对登录号有意义（匿名本就不落账号）；与「服务端多轮续接」互斥，`multi_turn` 开着时不生效
+  （临时对话不留列表，多轮要靠服务端留会话）。面板「设置」可开关，默认关。
+  - 判据：实测坐实 `inner[45]=1` 就是这个开关——登录号发两条、单一变量，不带它的进会话列表
+    （rpc MaZiqc），带 `inner[45]=1` 的不进（控制臂在、实验臂消失）。参考实现里一起设的
+    `inner[41]=[1]` 是噪音，我们默认本就发 `[1]`。
+
+## 4.20.2
+
+### 修复
+
+- **bl 自动跟随适配上游服务改名**。2026-10 上游把 bl 服务名从 `assistant-bard-web-server`
+  改成 `gemini-web-uiserver`（当前 `boq_gemini-web-uiserver_20261007.01_p0`）。校验正则原来
+  把服务名钉死，改名后自动跟随会把抓到的新值当"形状不对"拒掉、永远回退到配置里那个旧 bl。
+  放宽成只校验 `boq_<服务名>_<日期>.<版本>_p<数字>` 的总体形状，服务名随它改，兜底值也更到
+  当前。新旧两个 bl 实测都仍可用（端点路径没变），所以不影响在用的部署，只是让自动跟随恢复正常。
+
 ## 4.20.1
 
 ### 修复

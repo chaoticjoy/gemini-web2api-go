@@ -102,7 +102,9 @@ func setAPIKey(k string) error {
 }
 
 // requireAPIKey wraps a /v1/* handler with bearer-token auth.
-// Accepts: "Authorization: Bearer xxx" (OpenAI SDK default) or "x-api-key: xxx".
+// Accepts: "Authorization: Bearer xxx" (OpenAI SDK default), "x-api-key: xxx",
+// and Google SDK 的两种写法："x-goog-api-key: xxx" 头或 "?key=xxx" 查询参数
+// （/v1beta 原生 Gemini 接口的客户端只会这么带，不认就一律 401）。
 func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := getAPIKey()
@@ -117,10 +119,16 @@ func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 		if got == "" {
 			got = strings.TrimSpace(r.Header.Get("x-api-key"))
 		}
+		if got == "" {
+			got = strings.TrimSpace(r.Header.Get("x-goog-api-key"))
+		}
+		if got == "" {
+			got = strings.TrimSpace(r.URL.Query().Get("key"))
+		}
 		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(key)) != 1 {
 			writeJSON(w, 401, map[string]interface{}{
 				"error": map[string]string{
-					"message": "Invalid API key. Set Authorization: Bearer <key> or x-api-key header.",
+					"message": "Invalid API key. Set Authorization: Bearer <key>, x-api-key or x-goog-api-key header.",
 					"type":    "invalid_request_error",
 					"code":    "invalid_api_key",
 				},

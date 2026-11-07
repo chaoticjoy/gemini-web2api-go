@@ -8,18 +8,20 @@ import (
 	"strings"
 )
 
-// MCP（Model Context Protocol）服务器：把 Gemini 网页端的联网搜索暴露成一个
-// web_search 工具，供 Claude Desktop / Claude Code / Cursor 等 MCP 客户端调用。
+// MCP（Model Context Protocol）服务器：把 Gemini 网页端的联网搜索暴露成
+// web_search 工具，生图 / 音乐暴露成 generate_image / generate_music，视频暴露成
+// create_video_task / get_video_status（见 mcp_media.go），
+// 供 Claude Desktop / Claude Code / Cursor 等 MCP 客户端调用。
 //
 // 传输走 HTTP（Streamable HTTP），挂在后端现有 --port 上的 /mcp，跟 OpenAI 接口
 // 同一个进程、同一个端口——部署成服务器后远程客户端连 URL 就能用，复用现成的
 // 账号池 / 代理池 / 限流。（没做 stdio 那种客户端拉起本地子进程的传输。）
 //
-// 手写 JSON-RPC 2.0 而不引第三方 SDK：就一个工具、协议面很小（initialize /
-// tools/list / tools/call），手写没有依赖、跟单二进制的风格一致。
+// 手写 JSON-RPC 2.0 而不引第三方 SDK：协议面很小（initialize / tools/list /
+// tools/call），手写没有依赖、跟单二进制的风格一致。
 //
 // 搜索走 streamGenerate，白嫖现有的代理池 / 限流 / 重试 / 防封。匿名即可搜，
-// 所以不依赖 cookie 池。
+// 所以不依赖 cookie 池；媒体工具跟 chat 里的 gemini-image / gemini-music 一样要登录态。
 
 const mcpProtocolVersion = "2025-06-18"
 
@@ -125,32 +127,61 @@ func dispatchMCP(req *rpcRequest) *rpcResponse {
 		})
 
 	case "tools/list":
-		return ok(map[string]interface{}{"tools": []interface{}{webSearchToolDef()}})
+		return ok(map[string]interface{}{"tools": []interface{}{
+			webSearchToolDef(), generateImageToolDef(), generateMusicToolDef(),
+			createVideoTaskToolDef(), getVideoStatusToolDef()}})
 
 	case "tools/call":
 		var p struct {
-			Name      string `json:"name"`
-			Arguments struct {
-				Query string `json:"query"`
-			} `json:"arguments"`
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
 		}
 		if json.Unmarshal(req.Params, &p) != nil {
 			return fail(-32602, "invalid params")
 		}
-		if p.Name != "web_search" {
+		switch p.Name {
+		case "web_search":
+			query := strings.TrimSpace(getStr(p.Arguments, "query"))
+			if query == "" {
+				return ok(toolTextError("query 不能为空"))
+			}
+			text, err := mcpWebSearch(query)
+			if err != nil {
+				return ok(toolTextError("搜索失败: " + err.Error()))
+			}
+			return ok(map[string]interface{}{
+				"content": []interface{}{map[string]interface{}{"type": "text", "text": text}},
+			})
+		case "generate_image", "generate_music":
+			prompt := strings.TrimSpace(getStr(p.Arguments, "prompt"))
+			if prompt == "" {
+				return ok(toolTextError("prompt 不能为空"))
+			}
+			model, refs := "gemini-image", mcpStrings(p.Arguments["image_urls"])
+			if p.Name == "generate_music" {
+				model, refs = "gemini-music", nil
+			}
+			result, err := mcpGenerateMedia(model, prompt, refs)
+			if err != nil {
+				return ok(toolTextError("生成失败: " + err.Error()))
+			}
+			return ok(result)
+		case "create_video_task":
+			result, err := mcpCreateVideo(p.Arguments)
+			if err != nil {
+				return ok(toolTextError("建任务失败: " + err.Error()))
+			}
+			return ok(result)
+		case "get_video_status":
+			j := getVideoJob(strings.TrimSpace(getStr(p.Arguments, "id")))
+			if j == nil {
+				return ok(toolTextError("video task not found"))
+			}
+			withVideo, _ := p.Arguments["include_video"].(bool)
+			return ok(mcpVideoJobResult(j, withVideo))
+		default:
 			return fail(-32602, "unknown tool: "+p.Name)
 		}
-		query := strings.TrimSpace(p.Arguments.Query)
-		if query == "" {
-			return ok(toolTextError("query 不能为空"))
-		}
-		text, err := mcpWebSearch(query)
-		if err != nil {
-			return ok(toolTextError("搜索失败: " + err.Error()))
-		}
-		return ok(map[string]interface{}{
-			"content": []interface{}{map[string]interface{}{"type": "text", "text": text}},
-		})
 
 	case "ping":
 		return ok(map[string]interface{}{})

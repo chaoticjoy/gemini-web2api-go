@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -57,6 +58,18 @@ func TestToolFenceGate(t *testing.T) {
 			"看这段：\n```python\nprint(1)\n```\n就这样。",
 			"看这段：\n```python\nprint(1)\n```\n就这样。",
 		},
+		{
+			// 参数的字符串里带 ```：闭合围栏是 JSON 结束之后那个，不是第一个
+			"参数里带代码块",
+			"写文件。\n```tool_call\n" + fencedArgsCall + "\n```\n写好了。",
+			"写文件。\n\n写好了。",
+		},
+		{
+			// JSON 写坏了：退回第一个 ``` 当闭合
+			"围栏里 JSON 写坏了",
+			"a\n```tool_call\n{\"name\": f}\n```\nb",
+			"a\n\nb",
+		},
 	}
 
 	for _, c := range cases {
@@ -98,6 +111,34 @@ func TestToolFenceGateMatchesParse(t *testing.T) {
 	}
 }
 
+// fencedArgsCall 是一次写文件调用，content 里有两个 markdown 代码块（实测模型就这么吐：
+// ``` 原样出现在 JSON 字符串里，换行和引号正常转义）。
+const fencedArgsCall = `{"name": "write_file", "arguments": {"path": "README.md", "content": "# Foo\n\n` +
+	"```" + `bash\npip install foo\n` + "```" + `\n\n` + "```" + `python\nprint(\"hi\")\n` + "```" + `\n"}}`
+
+// 参数里的 ``` 不能把调用截断：要解析出完整参数，正文里不能漏出半截 JSON，
+// 流式发出的和最终文本要一致。
+func TestToolCallWithFencedArgs(t *testing.T) {
+	full := "写文件。\n```tool_call\n" + fencedArgsCall + "\n```\n写好了。"
+	final, calls := parseToolCalls(full)
+	if len(calls) != 1 || calls[0].Function.Name != "write_file" {
+		t.Fatalf("工具调用没解析出来: %+v，正文 %q", calls, final)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("参数不是合法 JSON: %v", err)
+	}
+	if want := "# Foo\n\n```bash\npip install foo\n```\n\n```python\nprint(\"hi\")\n```\n"; args["content"] != want {
+		t.Errorf("content 得到 %q，期望 %q", args["content"], want)
+	}
+	if final != "写文件。\n\n写好了。" {
+		t.Errorf("最终正文 %q", final)
+	}
+	if streamed := feed(t, chars(full)); strings.TrimSpace(streamed) != final {
+		t.Errorf("流式发出 %q，最终文本 %q", streamed, final)
+	}
+}
+
 // 未闭合的围栏：闸门扣住不发，收尾时由 remainingOf 补回去，客户端不会丢内容。
 func TestToolFenceGateUnclosed(t *testing.T) {
 	full := "开始了。\n```tool_call\n{\"name\": \"f\""
@@ -132,6 +173,51 @@ func TestPartialPrefixLen(t *testing.T) {
 	} {
 		if got := partialPrefixLen(c.s, m); got != c.want {
 			t.Errorf("partialPrefixLen(%q) = %d，期望 %d", c.s, got, c.want)
+		}
+	}
+}
+
+// 围栏里 arguments 缺失、为 null、换了键名、平铺、二次编码时，参数都要整理成 JSON 对象，
+// 绝不能是 "null"（OpenAI 客户端会拒收）；没有工具名的围栏丢弃，不发半个调用（#69）。
+func TestParseToolCallsArgsShapes(t *testing.T) {
+	cases := []struct {
+		fence    string
+		wantName string // 空 = 期望丢弃
+		wantArgs string
+	}{
+		{`{"name":"pwsh","arguments":{"command":"Get-Date"}}`, "pwsh", `{"command":"Get-Date"}`},
+		{`{"name":"pwsh"}`, "pwsh", `{}`},
+		{`{"name":"pwsh","arguments":null}`, "pwsh", `{}`},
+		{`{"name":"pwsh","parameters":{"command":"ls"}}`, "pwsh", `{"command":"ls"}`},
+		{`{"name":"pwsh","command":"pwd"}`, "pwsh", `{"command":"pwd"}`},
+		{`{"name":"pwsh","arguments":"{\"command\":\"echo hi\"}"}`, "pwsh", `{"command":"echo hi"}`},
+		{`{"tool":"read_file","input":{"path":"/a"}}`, "read_file", `{"path":"/a"}`},
+		{`{"type":"function","function":{"name":"f","arguments":"{\"a\":1}"}}`, "f", `{"a":1}`},
+		{`{"name":"pwsh","arguments":{"command":"ls"},"input":{"x":1}}`, "pwsh", `{"command":"ls"}`},
+		{`{"arguments":{"command":"x"}}`, "", ""},
+		{`null`, "", ""},
+	}
+	for _, c := range cases {
+		text, calls := parseToolCalls("前文\n```tool_call\n" + c.fence + "\n```")
+		if text != "前文" {
+			t.Errorf("%s: 正文 = %q", c.fence, text)
+		}
+		if c.wantName == "" {
+			if len(calls) != 0 {
+				t.Errorf("%s: 应丢弃，得到 %+v", c.fence, calls)
+			}
+			continue
+		}
+		if len(calls) != 1 {
+			t.Fatalf("%s: 得到 %d 个调用", c.fence, len(calls))
+		}
+		f := calls[0].Function
+		if f.Name != c.wantName || f.Arguments != c.wantArgs {
+			t.Errorf("%s: 得到 name=%q args=%s，期望 name=%q args=%s", c.fence, f.Name, f.Arguments, c.wantName, c.wantArgs)
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(f.Arguments), &m); err != nil || m == nil {
+			t.Errorf("%s: args 不是 JSON 对象：%s", c.fence, f.Arguments)
 		}
 	}
 }

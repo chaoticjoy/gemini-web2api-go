@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,12 @@ const (
 	// "当前 Flash" 泛指针，老批次号发它拿到的是 3.6，会冒充 3.7。老批次号发这个主 hex
 	// 会干净降级成 3.5 Flash-Lite（跟 3.1 Pro 一样），所以 gate 成要 cookie。
 	hexFlash38 = "56fdd199312815e2" // 3.8 Flash（原记 3.7；Google 把这个 hex 原地升成 3.8，HAR 响应帧显示名已是 "3.8 Flash"）
+	// 4 Argon（#35）：otAQ7b 清单里主 hex 95a4c0abcba24364、短名 Argon、代号 Argon4p0、
+	// 显示名 "4 Argon"。付费/Ultra 号专属。实测**真正选中它靠的是 MODE=8（header 下标 14 /
+	// inner[79]），不是 hex**：借来的 Ultra 号上，hex=Argon 配 mode=1 回报 "3.8 Flash"（mode 1
+	// 那个模型），hex=3.8Flash 配 mode=8 反而回报 "4 Argon"——mode 决定、hex 被忽略。所以 Argon
+	// 条目的 Mode 必须填 8。仍按浏览器把 hex 配成 Argon 主 hex（最忠实、将来若改回认 hex 也不塌）。
+	hexArgon4 = "95a4c0abcba24364"
 )
 
 // innerSlots 是 payload 里 inner 数组的长度。浏览器发 97-98 槽，我们原来只开 80，
@@ -45,6 +52,11 @@ const innerSlots = 97
 const (
 	thinkingNormal   = 1
 	thinkingExtended = 2
+	// thinkingMedium 是 4 Argon 网页 UI「中等」思考档的线值（低=1 / 高=2 / 中=4）。
+	// 判据：2026-10-19 的 processSession 抓包里选中档时 think 槽（新协议字段 #81 =
+	// 老 inner[80]）发的就是 4；与 #37 自述一致。中档的思考在服务端内部完成、响应
+	// 不吐思考链，所以不映射 reasoning_content。
+	thinkingMedium = 4
 )
 
 // ModelConfig holds the server-side model id plus the legacy MODE_CATEGORY value.
@@ -58,11 +70,46 @@ type ModelConfig struct {
 	// Thinking 为真时填 inner[80]=2，即网页 UI 上的「扩展思考」。跟 HexID 正交
 	// —— 三个模型都能开，不是某个专属模型。
 	Thinking bool
+	// ThinkWire >0 时直接作为思考档线值（header 下标15 / inner[80]），覆盖 Thinking
+	// 推出的 1/2。用于 4 Argon「中等」档（=thinkingMedium=4）。两者都不设 = 普通(1)。
+	ThinkWire int
 	// Tool 非 0 时填 inner[49]，让服务端换后端模型生成媒体产物（14=生图 Nano Banana
 	// / 21=音乐 Lyria）。产物不在 StreamGenerate 响应里，要再走 hNvQHb 拿下载链、
 	// 用下载 host 认的 cookie 子集下回原始字节，见 media.go。跟登录态绑定：匿名请求
 	// 这个会被静默降级成一句「Are you signed in?」文本。
 	Tool int
+	// Upstream 是真用上这个模型时服务端自报的显示名（不含思考档后缀："3.1 Pro High"
+	// 记 "3.1 Pro"）。strict_model 拿它判静默降级，空 = 不判（媒体工具回报的是
+	// "Nano Banana 2" 这类后端名）。只能用显示名：跟它并排的 hex 现在不管实际用了
+	// 哪个模型都回 Flash-Lite 的那个。
+	Upstream string
+	// VideoAspect is the inner[55] aspect code for video: 16 = 16:9 (default), 17 = 9:16.
+	VideoAspect int
+	// PinAccountID forces the request onto one cookie-pool account (no fallback to
+	// others). Required to continue a conversation, which lives in that account.
+	PinAccountID int64
+	// Cont, when set, sends this request as the next turn of an existing Gemini
+	// conversation (used for video extension: "reply to the video").
+	Cont *ConvRef
+}
+
+// ConvRef identifies the turn to continue: conversation id, the previous turn's
+// response id and response-candidate id, and that turn's index (first turn = 0).
+type ConvRef struct {
+	CID, RID, RCID string
+	Turn           int
+}
+
+// thinkWire 返回思考档线值（填 header 下标15 / inner[80]）：ThinkWire 显式指定优先，
+// 否则 Thinking→扩展(2)、默认普通(1)。对现有模型取值跟旧的 normal/extended 逐字一致。
+func (mc ModelConfig) thinkWire() int {
+	if mc.ThinkWire > 0 {
+		return mc.ThinkWire
+	}
+	if mc.Thinking {
+		return thinkingExtended
+	}
+	return thinkingNormal
 }
 
 // 只暴露服务端清单（batchexecute?rpcids=otAQ7b）里真实存在的模型。
@@ -70,22 +117,32 @@ type ModelConfig struct {
 // gemini-flash-lite 别名已移除：它们在服务端没有对应条目，留着只会让人
 // 以为有五种不同的模型可选。
 var Models = map[string]ModelConfig{
-	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Desc: "Latest all-around model"},
-	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Desc: "Fastest, lightweight"},
-	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
+	"gemini-3.6-flash":      {HexID: hexFlash36, Mode: 1, Upstream: "3.6 Flash", Desc: "Latest all-around model"},
+	"gemini-3.5-flash-lite": {HexID: hexFlashLite, Mode: 6, Upstream: "3.5 Flash-Lite", Desc: "Fastest, lightweight"},
+	"gemini-3.1-pro":        {HexID: hexPro31, Mode: 3, Upstream: "3.1 Pro", Desc: "Most capable; needs a signed-in cookie (downgraded to Flash-Lite without one)"},
 	// 3.8 Flash：Google 把原 3.7 那个 hex 原地升级了（同 hex，服务端显示名从 3.7 变 3.8）。
 	// 实测是**付费号专属**（不是灰度）：只有付费 Gemini 账号有，免费号降级成 3.5 Flash-Lite。
 	// gemini-3.7-flash 保留为别名（同 hex）。
-	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
-	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
+	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
+	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
+	// 4 Argon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
+	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
+	"gemini-4-argon": {HexID: hexArgon4, Mode: 8, Upstream: "4 Argon", Desc: "4 Argon (complex tasks); needs a signed-in PAID/Ultra Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
-	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
-	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
-	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
-	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
-	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Desc: "alias of gemini-3.8-flash-thinking"},
+	"gemini-3.6-flash-thinking":      {HexID: hexFlash36, Mode: 1, Thinking: true, Upstream: "3.6 Flash", Desc: "3.6 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.5-flash-lite-thinking": {HexID: hexFlashLite, Mode: 6, Thinking: true, Upstream: "3.5 Flash-Lite", Desc: "3.5 Flash-Lite with extended thinking; needs a signed-in cookie"},
+	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Upstream: "3.1 Pro", Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
+	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
+	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Upstream: "3.8 Flash", Desc: "alias of gemini-3.8-flash-thinking"},
+	// 4 Argon + 扩展思考：Mode=8（选 Argon）+ inner[80]=2（上游现在把这档叫 "High"）。
+	// 实测回报 "4 Argon High" 且带思考链（硬题 985 字符，走既有 [4][0][37][0][0] 路径，
+	// 无需改抽取代码）→ 映射成 reasoning_content。付费/Ultra 专属。
+	"gemini-4-argon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Upstream: "4 Argon", Desc: "4 Argon with extended thinking (High reasoning tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
+	// 中档：think 线值 4（高档是 2）。中档思考在服务端内部完成、不吐思考链，所以不设
+	// Thinking（不期望 reasoning_content），登录门控靠 hexArgon4 + thinkWire。
+	"gemini-4-argon-thinking-medium": {HexID: hexArgon4, Mode: 8, ThinkWire: thinkingMedium, Upstream: "4 Argon", Desc: "4 Argon at the Medium thinking tier (thinks server-side, no reasoning_content); needs a signed-in PAID/Ultra account"},
 
 	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
 	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
@@ -111,7 +168,7 @@ func hasCookie() bool {
 // 逐模型核对等价：那三个正名的 HexID 就是 hexPro31 / hexFlash38，其余登录模型都被
 // Thinking 或 Tool 覆盖。
 func modelNeedsLogin(mc ModelConfig) bool {
-	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.Thinking || mc.Tool > 0
+	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.HexID == hexArgon4 || mc.Thinking || mc.ThinkWire > 0 || mc.Tool > 0
 }
 
 // anonFirstEligible 判断「匿名优先」开关下这次请求能不能走匿名（不占 cookie 账号）：
@@ -120,6 +177,16 @@ func modelNeedsLogin(mc ModelConfig) bool {
 // 池里有号就用号）。
 func anonFirstEligible(mc ModelConfig, hasAttachment bool) bool {
 	return rtCfg().AnonFirst && !hasAttachment && !modelNeedsLogin(mc)
+}
+
+// temporaryChatEligible 判断这次请求该不该走网页端原生「临时对话」（inner[45]=1，#34）。
+//
+// 与 multi_turn 冲突：临时对话不进会话列表，而 multi_turn 要按历史认出续接、靠服务端
+// 留着这串对话——两个一起开，续接那半就没了。所以 multi_turn 开着时一律不发 inner[45]，
+// 由 multi_turn 决定会话怎么留。调用点还会再要求有登录 cookie：匿名本来就不落账号，
+// 发 inner[45] 是没验过的无谓偏离。
+func temporaryChatEligible() bool {
+	return rtCfg().TemporaryChat && !rtCfg().MultiTurn
 }
 
 // availableModels 返回当前配置下值得暴露的模型。
@@ -192,13 +259,15 @@ type StreamResult struct {
 	// 排查"加了 cookie 就大面积失败"时，最需要知道的正是失败那条用的哪个号。
 	AccountID    int64
 	AccountLabel string
-	TTFBMs       int64
-	TotalMs      int64
+	// Conversation ids of this turn (cid, rid, rcid), so a caller can continue it.
+	ConvCID, ConvRID, ConvRCID string
+	TTFBMs                     int64
+	TotalMs                    int64
 	// Artifacts 是媒体模型（生图/音乐）取回的产物原始字节，非媒体模型为空。
 	Artifacts []MediaArtifact
 	// MediaErr 记媒体产物取回失败的原因：生成本身 200 了、但走 hNvQHb / 下载那步挂了。
 	// 调用方据此报错，而不是返回一个只有文字没有图的「半成功」。
-	MediaErr string
+	MediaErr error
 }
 
 // RateLimitError 表示所有 IP slot 都达到了限流上限。
@@ -213,51 +282,6 @@ func (e *RateLimitError) Error() string {
 		return "direct IP slot full: " + e.Reason + " limit reached (configure proxies to scale)"
 	}
 	return "all proxy slots full: " + e.Reason + " limit reached"
-}
-
-func fetchOrStickyRemoteProxy(poolURL string) (Proxy, bool) {
-	return fetchOrStickyRemoteProxyExcept(poolURL, nil)
-}
-
-func fetchOrStickyRemoteProxyExcept(poolURL string, excludedURLs map[string]bool) (Proxy, bool) {
-	if rtCfg().ProxyStrategy == "sticky" {
-		sURL, sID, sName := getStickyProxy()
-		if _, isDyn := isDynamicSlot(sID); sURL != "" && isDyn {
-			if (excludedURLs != nil && excludedURLs[sURL]) || isDynamicProxyCooling(sURL) {
-				clearStickyProxy()
-			} else if ok, _ := trySlotAcquire(sID); ok {
-				return Proxy{ID: sID, Name: sName, URL: sURL, Enabled: true}, true
-			}
-		}
-	}
-	const maxFetchAttempts = 10
-	for fetchAttempt := 0; fetchAttempt < maxFetchAttempts; fetchAttempt++ {
-		pURL, err := fetchRemoteProxy(poolURL)
-		if err != nil {
-			logf("[proxy-pool] 从动态代理池 (%s) 获取代理失败: %v", poolURL, err)
-			return Proxy{}, false
-		}
-		if pURL == "" {
-			return Proxy{}, false
-		}
-		if (excludedURLs != nil && excludedURLs[pURL]) || isDynamicProxyCooling(pURL) {
-			continue
-		}
-		slotID := getDynamicSlotID(pURL)
-		if ok, _ := trySlotAcquire(slotID); ok {
-			pName := "Dynamic (" + pURL + ")"
-			if rtCfg().ProxyStrategy == "sticky" {
-				setStickyProxy(pURL, slotID, pName)
-			}
-			return Proxy{
-				ID:      slotID,
-				Name:    pName,
-				URL:     pURL,
-				Enabled: true,
-			}, true
-		}
-	}
-	return Proxy{}, false
 }
 
 // acquireSlot 选一个有容量的 slot 给本次请求用。
@@ -295,11 +319,15 @@ func acquireSlotExcept(preferProxyID int64, excludedIDs map[int64]bool, excluded
 
 	case "static_only":
 		if hasProxies {
-			if p, ok := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
+			if p, ok, reason := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
 				return p, true, nil
+			} else if reason == "unavailable" {
+				return Proxy{}, false, fmt.Errorf("proxy_unavailable: all configured proxies are disabled or in circuit-breaker cooldown")
+			} else {
+				return Proxy{ID: -1, Name: "静态代理池(满/熔断)"}, false, &RateLimitError{Reason: reason, ProxyID: -1}
 			}
 		}
-		return Proxy{ID: -1, Name: "静态代理池(满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+		return Proxy{}, false, fmt.Errorf("proxy_unavailable: no configured proxies in static pool")
 
 	case "dynamic_only":
 		if hasPoolURL {
@@ -311,8 +339,12 @@ func acquireSlotExcept(preferProxyID int64, excludedIDs map[int64]bool, excluded
 
 	case "pool_only":
 		// 代理优先模式：先试静态，再试动态，绝不直连
+		var staticReason string
 		if hasProxies {
-			if p, ok := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
+			var ok bool
+			var p Proxy
+			p, ok, staticReason = pickProxyPreferringExcept(preferProxyID, excludedIDs)
+			if ok {
 				return p, true, nil
 			}
 		}
@@ -321,11 +353,18 @@ func acquireSlotExcept(preferProxyID int64, excludedIDs map[int64]bool, excluded
 				return p, true, nil
 			}
 		}
+		if !hasPoolURL && staticReason == "unavailable" {
+			return Proxy{}, false, fmt.Errorf("proxy_unavailable: all configured proxies are disabled or in circuit-breaker cooldown")
+		}
 		return Proxy{ID: -1, Name: "代理池(全部满/熔断)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
 
 	default: // "auto" 自动混合模式
+		var staticReason string
 		if hasProxies {
-			if p, ok := pickProxyPreferringExcept(preferProxyID, excludedIDs); ok {
+			var ok bool
+			var p Proxy
+			p, ok, staticReason = pickProxyPreferringExcept(preferProxyID, excludedIDs)
+			if ok {
 				return p, true, nil
 			}
 		}
@@ -336,7 +375,14 @@ func acquireSlotExcept(preferProxyID int64, excludedIDs map[int64]bool, excluded
 		}
 		if hasProxies || hasPoolURL {
 			if !rtCfg().FallbackDirect {
-				return Proxy{ID: -1, Name: "代理池(满/不可用)"}, false, &RateLimitError{Reason: "rph", ProxyID: -1}
+				if !hasPoolURL && staticReason == "unavailable" {
+					return Proxy{}, false, fmt.Errorf("proxy_unavailable: all configured proxies are disabled or in circuit-breaker cooldown")
+				}
+				r := staticReason
+				if r == "" || r == "unavailable" {
+					r = "rph"
+				}
+				return Proxy{ID: -1, Name: "代理池(满/不可用)"}, false, &RateLimitError{Reason: r, ProxyID: -1}
 			}
 			logf("[proxy] 代理池无可用出口，本次退回直连（fallback_direct 已开）")
 		}
@@ -374,6 +420,22 @@ func (d *deltaTracker) Push(fullText string) string {
 	return delta
 }
 
+// pinnedAccountError 表示 PinAccountID 指定的号用不了：Err 为 nil 是号被删 / 停用，
+// 否则是登录态失效（Err 是取 XSRF 的错）。调用方靠它判断「换下一个号」，不比文案。
+type pinnedAccountError struct {
+	ID  int64
+	Err error
+}
+
+func (e *pinnedAccountError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("account #%d is not available (deleted or disabled)", e.ID)
+	}
+	return fmt.Sprintf("pinned account #%d is not signed in: %v", e.ID, e.Err)
+}
+
+func (e *pinnedAccountError) Unwrap() error { return e.Err }
+
 // streamGenerate POSTs to Gemini's StreamGenerate endpoint and returns raw body
 // plus proxy/timing telemetry for the metrics layer.
 // The 80-slot inner array is verbatim from the Python reference.
@@ -399,8 +461,32 @@ type fileRef struct {
 // 匿名能把文件传上去，但对话里一引用就被服务端回 1100。
 func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pendingUpload,
 	onDelta, onReasoning func(string)) (*StreamResult, error) {
-	var files []fileRef
+	// strict_model 换号：被降级的号记冷却、本次排除，换下一个号重来。上限跟 XSRF 换号
+	// 一样是 maxCookieTries——连着几个号都降级，说明池子整体见底，不是撞上个别号。
+	exclude := map[int64]bool{}
+	var res *StreamResult
+	var err error
+	for try := 0; try < maxCookieTries; try++ {
+		next, nextErr := streamGenerateOnce(prompt, latest, mc, pending, onDelta, onReasoning, exclude)
+		var exhausted *ModelDowngradedError
+		if try > 0 && errors.As(nextErr, &exhausted) && exhausted.Reported == "" {
+			// 换号时已经没号可挑：报上一个号真实的降级（带自报模型名），补上解冻时间
+			var last *ModelDowngradedError
+			if errors.As(err, &last) {
+				last.RetryAfter = exhausted.RetryAfter
+			}
+			return res, err
+		}
+		res, err = next, nextErr
+		if !retryOnAnotherAccount(res, err, mc, exclude) {
+			return res, err
+		}
+	}
+	return res, err
+}
 
+func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pendingUpload,
+	onDelta, onReasoning func(string), exclude map[int64]bool) (*StreamResult, error) {
 	// 先挑号，再按它上次绑的出口挑代理 —— 同一个账号要尽量固定从同一个 IP 出去，
 	// 否则一个号在几十个出口之间跳，在 Google 眼里就是账号共享的特征。
 	//
@@ -409,10 +495,19 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// #20 匿名优先：不需要登录态能力时不占用 cookie 账号，走匿名省额度（见 anonFirstEligible）。
 	// 带附件（图/视频）时不能走匿名——下面 uploadBytes 那段会因 cookieStr=="" 直接报错。
 	var acct *CookieAccount
-	if !anonFirstEligible(mc, len(pending) > 0) {
-		if a, ok := pickCookieAccount(); ok {
-			acct = a
+	skip := exclude
+	if mc.PinAccountID > 0 {
+		a := accountByID(mc.PinAccountID)
+		if a == nil || a.Status != "enabled" {
+			return &StreamResult{}, &pinnedAccountError{ID: mc.PinAccountID}
 		}
+		acct = a
+	} else if !anonFirstEligible(mc, len(pending) > 0) {
+		a, s, err := pickAccountForModel(mc, exclude)
+		if err != nil {
+			return &StreamResult{}, err
+		}
+		acct, skip = a, s
 	}
 	preferProxy := int64(0)
 	if acct != nil {
@@ -449,35 +544,48 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	defer releaseCurrentSlot()
 
 	cookieStr, sapisid, xsrfToken := "", "", ""
+	authUser := 0 // 最终用上的那个号的账号序号（/u/N），匿名为 0
 	var lastCookieErr error
 	tried := map[int64]bool{}
 	rotatedOnce := map[int64]bool{}
 
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
-	var lineCB func(string)
-	if onDelta != nil || onReasoning != nil {
-		lineCB = func(line string) {
-			if onReasoning != nil {
-				if r := reasoningInLine(line); r != "" {
-					if d := rtracker.Push(r); d != "" {
-						onReasoning(d)
-					}
+	strictCheck := strictLineCheck(mc, func() int64 { return cookieID })
+	var lineCB func(string) error
+	if onDelta != nil || onReasoning != nil || strictCheck != nil {
+		lineCB = func(line string) error {
+			if strictCheck != nil {
+				if err := strictCheck(line); err != nil {
+					return err
 				}
 			}
-			if onDelta == nil {
-				return
+			// 出错话术在吐给客户端之前拦下，中断读取走下面的重试。
+			if failureReplyInLine(line) {
+				return errUpstreamFailureReply
 			}
-			for _, t := range textsInLine(line) {
+			// 思考链先推完才轮到正文，所以先处理它，客户端拿到的顺序才对。
+			if onReasoning != nil {
+				if r := reasoningInLine(line); r != "" {
+				if d := rtracker.Push(r); d != "" {
+					onReasoning(d)
+				}
+			}
+			}
+			if onDelta == nil {
+				return nil
+			}
+			for _, t := range renderedTextsInLine(line, false) {
 				if d := tracker.Push(t); d != "" {
 					onDelta(d)
 				}
 			}
+			return nil
 		}
 	}
 
 	var lastErr error
-	var lastStatus int
+	lastStatus := 0
 	t0 := time.Now()
 
 	for proxySwitch := 0; proxySwitch <= maxProxySwitches; proxySwitch++ {
@@ -506,9 +614,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			for acct != nil && len(tried) < maxCookieTries {
 				tried[acct.ID] = true
 				cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-				tok, err := getXSRF(acct.Cookie, proxyURL)
+				tok, err := getXSRF(acct.Cookie, acct.AuthUser, proxyURL)
 				if err == nil {
 					cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
+					authUser = acct.AuthUser
 					if acct.ProxyID == 0 || !proxyUsableByID(acct.ProxyID) {
 						bindAccountProxy(acct.ID, picked.ID)
 					}
@@ -518,10 +627,11 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 					rotatedOnce[acct.ID] = true
 					if _, _, rerr := rotateAccount(*acct); rerr == nil {
 						if fresh := accountByID(acct.ID); fresh != nil {
-							if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
+							if tok2, err2 := getXSRF(fresh.Cookie, fresh.AuthUser, proxyURL); err2 == nil {
 								logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
 								acct = fresh
 								cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
+								authUser = fresh.AuthUser
 								if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
 									bindAccountProxy(fresh.ID, picked.ID)
 								}
@@ -530,13 +640,29 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 						}
 					}
 				}
-				markCookieByStatus(acct.ID, 401, err.Error())
+				if xsrfErrBlamesCookie(err) {
+					markCookieByStatus(acct.ID, 401, err.Error())
+				}
 				lastCookieErr = err
 				logf("[cookie] 账号 #%d 不可用，换下一个：%v", acct.ID, err)
-				acct, _ = pickCookieAccountExcept(tried)
+				if mc.PinAccountID > 0 {
+					acct = nil
+					continue
+				}
+				next := map[int64]bool{}
+				for id := range skip {
+					next[id] = true
+				}
+				for id := range tried {
+					next[id] = true
+				}
+				acct, _ = pickCookieAccountExcept(next)
 			}
 		}
 		if lastCookieErr != nil && cookieStr == "" {
+			if mc.PinAccountID > 0 {
+				return attrib(&pinnedAccountError{ID: mc.PinAccountID, Err: lastCookieErr})
+			}
 			if !rtCfg().FallbackAnon {
 				return attrib(fmt.Errorf("cookie 池里 %d 个账号都不可用（最后一个：%w）；"+
 					"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
@@ -546,7 +672,8 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			cookieID, cookieLabel = 0, ""
 		}
 
-		if len(pending) > 0 && len(files) == 0 {
+		var files []fileRef
+		if len(pending) > 0 {
 			if cookieStr == "" {
 				return attrib(fmt.Errorf("image input needs a Google account cookie: " +
 					"anonymous uploads succeed but referencing them in a conversation is " +
@@ -555,7 +682,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			nImg, nVid := 0, 0
 			uploadFailed := false
 			for _, u := range pending {
-				ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
+				ref, uerr := uploadBytes(cookieStr, authUser, proxyURL, u.Data, u.Name)
 				if uerr != nil {
 					lastErr = fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr)
 					uploadFailed = true
@@ -589,7 +716,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 
 		curPrompt := prompt
 		budget := rtCfg().MaxPromptBytes
-		if p, f, used, ferr := prepareContextFile(curPrompt, latest, budget, cookieStr, proxyURL); ferr != nil {
+		if p, f, used, ferr := prepareContextFile(curPrompt, latest, budget, cookieStr, authUser, proxyURL); ferr != nil {
 			return attrib(ferr)
 		} else if used {
 			curPrompt = p
@@ -630,28 +757,39 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		inner[10] = 1
 		inner[11] = 0
 		inner[17] = []interface{}{[]interface{}{0}}
+		if mc.Cont != nil {
+			inner[2] = []interface{}{mc.Cont.CID, mc.Cont.RID, mc.Cont.RCID, nil, nil, nil, nil, nil, nil, ""}
+			inner[17] = []interface{}{[]interface{}{mc.Cont.Turn}}
+		}
 		inner[18] = 0
 		inner[27] = 1
 		inner[30] = []interface{}{4}
 		inner[41] = []interface{}{1}
+		if temporaryChatEligible() && cookieStr != "" {
+			inner[45] = 1
+		}
 		inner[53] = 0
 		reqUUID := uuid.NewString()
 		inner[59] = reqUUID
 		inner[61] = []interface{}{}
 		inner[68] = 1
 		inner[79] = mc.Mode
-		inner[80] = thinkingNormal
+		tw := mc.thinkWire()
+		inner[80] = tw
 		inner[91] = 0
 		inner[96] = 0
-		if mc.Thinking {
-			inner[80] = thinkingExtended
+		if tw != thinkingNormal {
 			inner[96] = 1
 		}
 		if mc.Tool > 0 {
 			inner[49] = mc.Tool
 		}
 		if mc.Tool == toolVideo {
-			inner[55] = []interface{}{[]interface{}{16}}
+			aspect := 16
+			if mc.VideoAspect == 17 {
+				aspect = 17
+			}
+			inner[55] = []interface{}{[]interface{}{aspect}}
 		}
 
 		innerJSON, err := json.Marshal(inner)
@@ -672,46 +810,65 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			}
 			return form.Encode()
 		}
-
 		body := buildBody(xsrfToken)
 
-		thinkVal := thinkingNormal
-		if mc.Thinking {
-			thinkVal = thinkingExtended
-		}
-		modelHeader := buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
+		modelHeader := buildModelHeader(mc.HexID, mc.Mode, mc.thinkWire(), uuid.NewString())
 		sessionHeader := fmt.Sprintf(`["%s",1]`, reqUUID)
-
 		geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+		setAuthUserHeaders(geminiHeaders, authUser)
 		geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
 		geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
 
 		reqid := time.Now().Unix() % 1000000
 		endpoint := fmt.Sprintf(
-			"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-			currentBL(proxyURL), reqid,
+			"%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+			geminiBase(authUser), currentBL(proxyURL), reqid,
 		)
 
-		xsrfRetried := false
+		useWC := rtCfg().WebChannel
+		wcReq := wcRequest{
+			Inner: wcInnerWithoutPrompt(inner), Prompt: curPrompt,
+			HexID: mc.HexID, Mode: mc.Mode, Think: mc.thinkWire(),
+			Cookie: cookieStr, SAPISID: sapisid, AuthUser: authUser,
+		}
 
+		xsrfRetried := false
 		for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-			statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			var statusCode int
+			var raw []byte
+			var ttfb int64
+			var setCookie []string
+			var reqErr error
+			if useWC {
+				wcReq.Cookie = cookieStr
+				statusCode, raw, ttfb, setCookie, reqErr = doWebChannelRequest(wcReq, proxyURL, lineCB)
+			} else {
+				statusCode, raw, ttfb, setCookie, reqErr = doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+			}
 			if len(setCookie) > 0 && cookieID > 0 {
 				if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
 					cookieStr = merged
 					updateAccountCookie(cookieID, merged)
 				}
 			}
-			if err != nil {
-				lastErr = err
-				if pickedOK {
-					recordProxyResult(picked.ID, false, err.Error())
+			var mde *ModelDowngradedError
+			if errors.As(reqErr, &mde) {
+				res, _ := attrib(nil)
+				res.UpstreamModel = mde.Reported
+				res.TotalMs = time.Since(t0).Milliseconds()
+				res.Emitted, res.EmittedReasoning = tracker.emitted, rtracker.emitted
+				return res, reqErr
+			}
+			if reqErr != nil {
+				lastErr = reqErr
+				if pickedOK && !errors.Is(reqErr, errUpstreamFailureReply) {
+					recordProxyResult(picked.ID, false, reqErr.Error())
 				}
 				if tracker.emitted != "" || rtracker.emitted != "" {
 					break
 				}
 				if attempt < rtCfg().RetryAttempts-1 {
-					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
+					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, reqErr)
 					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 				}
 				continue
@@ -720,9 +877,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 					xsrfRetried = true
 					invalidateXSRF(cookieStr)
-					if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
+					if tok, e := getXSRF(cookieStr, authUser, proxyURL); e == nil {
 						body = buildBody(tok)
 						geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
+						setAuthUserHeaders(geminiHeaders, authUser)
 						geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
 						geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
 						attempt--
@@ -738,12 +896,12 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 					break
 				}
 				if attempt < rtCfg().RetryAttempts-1 {
-					logf("retry %d/%d (HTTP %d): %v", attempt+1, rtCfg().RetryAttempts, statusCode, lastErr)
 					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 				}
 				continue
 			}
-			if !hasContentFrame(string(raw)) {
+
+			if !hasContentFrame(string(raw)) && !videoAccepted(mc.Tool, string(raw)) {
 				lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
 				if pickedOK {
 					recordProxyResult(picked.ID, false, lastErr.Error())
@@ -757,6 +915,19 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				}
 				continue
 			}
+
+			if hasFailureReply(string(raw)) {
+				lastErr = errUpstreamFailureReply
+				if tracker.emitted != "" || rtracker.emitted != "" {
+					break
+				}
+				if attempt < rtCfg().RetryAttempts-1 {
+					logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, lastErr)
+					time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
+				}
+				continue
+			}
+
 			if pickedOK {
 				recordProxyResult(picked.ID, true, "")
 			}
@@ -774,6 +945,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				TTFBMs:           ttfb,
 				TotalMs:          time.Since(t0).Milliseconds(),
 			}
+
 			if mc.Tool == toolImage || mc.Tool == toolMusic || mc.Tool == toolVideo {
 				mime := "image/png"
 				switch mc.Tool {
@@ -782,20 +954,27 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				case toolVideo:
 					mime = "video/mp4"
 				}
-				arts, aerr := fetchMediaArtifacts(
-					mc.Tool, string(raw), extractConversationID(string(raw)),
-					cookieStr, sapisid, xsrfToken, proxyURL, mime)
+				cid, rid, _, _ := parseConvIDs(string(raw))
+				if cid == "" {
+					cid = extractConversationID(string(raw))
+				}
+				result.ConvCID, result.ConvRID = cid, rid
+				arts, rcid, aerr := fetchMediaArtifacts(
+					mc.Tool, string(raw), cid, rid,
+					cookieStr, sapisid, xsrfToken, proxyURL, mime, authUser)
+				result.ConvRCID = rcid
 				if aerr != nil {
 					logf("[media] 取回产物失败: %v", aerr)
-					result.MediaErr = aerr.Error()
+					result.MediaErr = aerr
 				} else {
 					result.Artifacts = arts
 					logf("[media] 取回 %d 份产物", len(arts))
 				}
 			}
-			if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
+
+			if rtCfg().AutoDeleteConversation && !temporaryChatEligible() && cookieStr != "" && xsrfToken != "" {
 				if cid := extractConversationID(string(raw)); cid != "" {
-					go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
+					go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL, authUser)
 				}
 			}
 			return result, nil
@@ -809,7 +988,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			if proxyURL != "" {
 				excludedURLs[proxyURL] = true
 			}
-			if pickedOK {
+			if pickedOK && !errors.Is(lastErr, errUpstreamFailureReply) {
 				forceProxyCooldown(picked.ID, lastErr.Error())
 			}
 			logf("[proxy] 代理 %s (ID %d) 在 %d 次重试后仍失败，准备切换下一个代理 (第 %d/%d 次切换)...",
@@ -888,13 +1067,24 @@ func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
 	return h
 }
 
+// setAuthUserHeaders 把请求头对齐到第 authuser 个号：Referer 换成 /u/N/app，
+// X-Goog-AuthUser 写 N。选号靠的是请求路径（见 geminiBase），这个头实测被忽略，
+// 写成 N 只是不让它跟路径自相矛盾。authuser=0 时保持原样。
+func setAuthUserHeaders(h map[string]string, authuser int) {
+	if authuser <= 0 {
+		return
+	}
+	h["Referer"] = geminiBase(authuser) + "/app"
+	h["X-Goog-AuthUser"] = strconv.Itoa(authuser)
+}
+
 // doGeminiRequest 发一次请求到 endpoint。proxyURL 非空走 stdlib（支持 socks5/http），
 // 空走 tls-client（chrome146 真指纹）。返回 (HTTP status, body bytes, err)。
 // 返回值多了 setCookie：服务端几乎每个响应都在刷新 SIDCC / __Secure-1PSIDCC /
 // __Secure-3PSIDCC，浏览器收下再带回去。一直发旧值的客户端会被判定为过期会话，
 // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
 func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
-	onLine func(string)) (int, []byte, int64, []string, error) {
+	onLine func(string) error) (int, []byte, int64, []string, error) {
 	sendAt := time.Now()
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
@@ -941,7 +1131,8 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 }
 
 // readBody 读完整个响应体并原样返回；onLine 非 nil 时每读到一行就回调一次，
-// 让上层能在上游还没写完时就往客户端转发。
+// 让上层能在上游还没写完时就往客户端转发。onLine 返回错误就停止读取、原样返回
+// 这个错误（strict_model 看到降级时用它掐断，不再白等上游把整段生成完）。
 //
 // 始终走逐行扫描（而不是 onLine==nil 时图省事用 io.ReadAll），因为要拿到
 // **第一行到达的时刻**当 TTFB。用 ReadAll 的话读完才返回，测出来的"首字节
@@ -949,7 +1140,7 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 //
 // start 必须是**请求发出前**的时刻，由调用方传入。放在本函数里取 time.Now()
 // 是不对的：那时 client.Do 已经返回、响应头甚至部分 body 都到了，测出来恒为 0。
-func readBody(r io.Reader, onLine func(string), start time.Time) ([]byte, int64, error) {
+func readBody(r io.Reader, onLine func(string) error, start time.Time) ([]byte, int64, error) {
 	var buf bytes.Buffer
 	sc := bufio.NewScanner(io.TeeReader(r, &buf))
 	// 单帧可能很大（实测见过 40 万字节的响应），默认 64KB 上限不够。
@@ -960,7 +1151,9 @@ func readBody(r io.Reader, onLine func(string), start time.Time) ([]byte, int64,
 			ttfb = time.Since(start).Milliseconds()
 		}
 		if onLine != nil {
-			onLine(sc.Text())
+			if err := onLine(sc.Text()); err != nil {
+				return buf.Bytes(), ttfb, err
+			}
 		}
 	}
 	if ttfb < 0 {
@@ -1081,6 +1274,61 @@ func textsInLine(line string) []string {
 	return texts
 }
 
+// errUpstreamFailureReply 是上游「出错话术」回复：HTTP 200、有正文，但正文是
+// "I seem to be encountering an error" / "Sorry, something went wrong" 这类固定句子，
+// 不是模型真回答（#68）。
+var errUpstreamFailureReply = errors.New("upstream returned a failure reply (inner[31] set)")
+
+// failureReplyInLine 判断这一帧是不是上游的出错话术回复。
+//
+// 判据是 inner[31] 为真（老协议 true、新协议 JSPB 里是 1）。实测（2026-11-05，匿名 +
+// Ultra 号、新老协议）6/6 条出错话术都带它，36 条正常回答和 3 条内容政策拒答（"I cannot
+// …"）都不带。不按文案匹配：文案至少 4 种、随语言变。这一位在第一个内容帧就有，所以
+// 流式也能在吐给客户端之前拦下。
+func failureReplyInLine(line string) bool {
+	if !strings.Contains(line, `"wrb.fr"`) || len(line) < 200 {
+		return false
+	}
+	var arr []interface{}
+	if err := json.Unmarshal([]byte(line), &arr); err != nil || len(arr) == 0 {
+		return false
+	}
+	first, ok := arr[0].([]interface{})
+	if !ok || len(first) < 3 {
+		return false
+	}
+	innerStr, ok := first[2].(string)
+	if !ok || len(innerStr) < 50 {
+		return false
+	}
+	var inner []interface{}
+	if err := json.Unmarshal([]byte(innerStr), &inner); err != nil || len(inner) <= 31 {
+		return false
+	}
+	switch v := inner[31].(type) {
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	}
+	return false
+}
+
+func hasFailureReply(raw string) bool {
+	for _, line := range strings.Split(raw, "\n") {
+		if failureReplyInLine(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// videoAccepted reports whether a video StreamGenerate response shows the job was
+// queued upstream (a conversation was created), even without a text content frame.
+func videoAccepted(tool int, raw string) bool {
+	return tool == toolVideo && extractConversationID(raw) != ""
+}
+
 // hasContentFrame 判断响应里到底有没有内容帧。
 //
 // 故意不复用 extractResponseText：那个会先 cleanGeminiText 掉代码产物，一个纯代码
@@ -1100,7 +1348,7 @@ func hasContentFrame(raw string) bool {
 func extractResponseText(raw string) string {
 	var texts []string
 	for _, line := range strings.Split(raw, "\n") {
-		texts = append(texts, textsInLine(line)...)
+		texts = append(texts, renderedTextsInLine(line, true)...)
 	}
 	for i := len(texts) - 1; i >= 0; i-- {
 		if strings.TrimSpace(texts[i]) != "" {
@@ -1193,7 +1441,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	// probe 是旁路探测，不回写 cookie 健康度：它的失败原因跟 cookie 无关。
 	// 但 at 必须带——否则挂了 cookie 之后连通性探测会一直报 400，假报故障。
 	cookieStr, sapisid := loadCookie()
-	if tok, e := getXSRF(cookieStr, proxyURL); e == nil && tok != "" {
+	if tok, e := getXSRF(cookieStr, 0, proxyURL); e == nil && tok != "" {
 		form.Set("at", tok)
 		body = form.Encode()
 	}

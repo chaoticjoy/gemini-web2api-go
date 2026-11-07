@@ -1,12 +1,7 @@
 package app
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,128 +25,7 @@ var (
 	proxyMu     sync.RWMutex
 	proxyCache  []Proxy
 	proxyCursor uint64
-
-	dynamicSlotsMu   sync.RWMutex
-	dynamicProxyMap  = map[string]int64{}
-	dynamicProxyURLs = map[int64]string{}
-	nextDynamicID    int64 = -1000
 )
-
-func getDynamicSlotID(proxyURL string) int64 {
-	dynamicSlotsMu.Lock()
-	defer dynamicSlotsMu.Unlock()
-	if id, ok := dynamicProxyMap[proxyURL]; ok {
-		return id
-	}
-	id := nextDynamicID
-	nextDynamicID--
-	dynamicProxyMap[proxyURL] = id
-	dynamicProxyURLs[id] = proxyURL
-	return id
-}
-
-func isDynamicSlot(id int64) (string, bool) {
-	dynamicSlotsMu.RLock()
-	defer dynamicSlotsMu.RUnlock()
-	url, ok := dynamicProxyURLs[id]
-	return url, ok
-}
-
-type dynamicProxyStat struct {
-	failCount int
-	lastUsed  int64
-	lastError string
-}
-
-var (
-	dynamicStatsMu sync.RWMutex
-	dynamicStats   = map[string]*dynamicProxyStat{}
-)
-
-func recordDynamicProxyResult(proxyURL string, success bool, errStr string) {
-	if proxyURL == "" {
-		return
-	}
-	dynamicStatsMu.Lock()
-	defer dynamicStatsMu.Unlock()
-
-	now := time.Now().Unix()
-	st, ok := dynamicStats[proxyURL]
-	if !ok {
-		st = &dynamicProxyStat{}
-		dynamicStats[proxyURL] = st
-	}
-	st.lastUsed = now
-	if success {
-		st.failCount = 0
-		st.lastError = ""
-	} else {
-		st.failCount++
-		st.lastError = errStr
-		cooldownMin := rtCfg().ProxyCooldownMin
-		threshold := proxyFailThreshold()
-		if st.failCount == threshold && cooldownMin > 0 {
-			logf("[proxy-dynamic] 动态代理 %s 连续失败达到重试上限（%d 次），进入熔断冷却（%d 分钟）", proxyURL, threshold, cooldownMin)
-		}
-	}
-
-	if len(dynamicStats) > 500 {
-		cooldownSec := int64(rtCfg().ProxyCooldownMin) * 60
-		if cooldownSec <= 0 {
-			cooldownSec = 7200
-		}
-		for k, v := range dynamicStats {
-			if now-v.lastUsed > cooldownSec*2 && v.failCount == 0 {
-				delete(dynamicStats, k)
-			}
-		}
-	}
-}
-
-// forceDynamicProxyCooldown 在动态代理发生不可用错误（如连接拒绝、EOF、建匿名会话失败）或切代理时直接进入熔断冷却
-func forceDynamicProxyCooldown(proxyURL string, errStr string) {
-	if proxyURL == "" {
-		return
-	}
-	dynamicStatsMu.Lock()
-	defer dynamicStatsMu.Unlock()
-
-	now := time.Now().Unix()
-	st, ok := dynamicStats[proxyURL]
-	if !ok {
-		st = &dynamicProxyStat{}
-		dynamicStats[proxyURL] = st
-	}
-	st.lastUsed = now
-	st.failCount = proxyFailThreshold()
-	st.lastError = errStr
-	cooldownMin := rtCfg().ProxyCooldownMin
-	if cooldownMin > 0 {
-		logf("[proxy-dynamic] 动态代理 %s 发生连接故障，直接进入熔断冷却（%d 分钟）: %s", proxyURL, cooldownMin, errStr)
-	}
-}
-
-// isDynamicProxyCooling 判断动态代理是否处于冷却期
-func isDynamicProxyCooling(proxyURL string) bool {
-	if proxyURL == "" {
-		return false
-	}
-	cooldownMin := rtCfg().ProxyCooldownMin
-	if cooldownMin <= 0 {
-		return false
-	}
-	dynamicStatsMu.RLock()
-	st, ok := dynamicStats[proxyURL]
-	dynamicStatsMu.RUnlock()
-	if !ok || st == nil {
-		return false
-	}
-	if st.failCount < proxyFailThreshold() {
-		return false
-	}
-	now := time.Now().Unix()
-	return now-st.lastUsed < int64(cooldownMin)*60
-}
 
 // loadProxies 从 DB 刷新内存里的代理列表。
 //
@@ -192,34 +66,6 @@ func loadProxies() {
 	proxyMu.Unlock()
 }
 
-var (
-	stickyMu       sync.RWMutex
-	lastStickyURL  string
-	lastStickyID   int64
-	lastStickyName string
-)
-
-func getStickyProxy() (string, int64, string) {
-	stickyMu.RLock()
-	defer stickyMu.RUnlock()
-	return lastStickyURL, lastStickyID, lastStickyName
-}
-
-func setStickyProxy(url string, id int64, name string) {
-	stickyMu.Lock()
-	lastStickyURL = url
-	lastStickyID = id
-	lastStickyName = name
-	stickyMu.Unlock()
-}
-
-func clearStickyProxy() {
-	stickyMu.Lock()
-	lastStickyURL = ""
-	lastStickyID = 0
-	lastStickyName = ""
-	stickyMu.Unlock()
-}
 
 // proxyFailThreshold 获取代理熔断失败阈值：直接对齐面板设置的「重试次数」（retry_attempts）。
 // 如果配置非法或未设置，回退保底为 1。
@@ -399,23 +245,29 @@ func poolHasProxyURL(url string) bool {
 //
 // 跟旧的 pickProxy 区别：会问 trySlotAcquire 看 slot 是否有容量；
 // 调用方拿到的 slot 必须配套调 slotRelease(proxy.ID)。
-func pickProxyWithCapacity() (Proxy, bool) { return pickProxyPreferring(0) }
+func pickProxyWithCapacity() (Proxy, bool) {
+	p, ok, _ := pickProxyPreferring(0)
+	return p, ok
+}
 
 // pickProxyPreferring 优先挑 preferID 那个出口，它不可用或没容量时才轮询别的。
 //
 // 为什么要粘住：cookie 池和代理池各自独立轮转的话，同一个 Google 账号会在几十个
 // 出口 IP 之间来回跳 —— 这在 Google 眼里正是账号共享的特征。粘不住时宁可换出口
 // 也不排队等，可用性优先。
-func pickProxyPreferring(preferID int64) (Proxy, bool) {
+// When no route can be selected, reason is either a true slot limit
+// (concurrent/rpm/rph/mixed), or "unavailable" when all proxy circuits
+// are disabled or cooling down. Do not conflate those cases.
+func pickProxyPreferring(preferID int64) (Proxy, bool, string) {
 	return pickProxyPreferringExcept(preferID, nil)
 }
 
 // pickProxyPreferringExcept 优先挑 preferID 那个出口，跳过 excludedIDs 中的代理。
-func pickProxyPreferringExcept(preferID int64, excludedIDs map[int64]bool) (Proxy, bool) {
+func pickProxyPreferringExcept(preferID int64, excludedIDs map[int64]bool) (Proxy, bool, string) {
 	proxyMu.RLock()
 	defer proxyMu.RUnlock()
 	if len(proxyCache) == 0 {
-		return Proxy{}, false
+		return Proxy{}, false, "unavailable"
 	}
 	now := time.Now().Unix()
 	cooldown := rtCfg().ProxyCooldownMin
@@ -429,13 +281,26 @@ func pickProxyPreferringExcept(preferID int64, excludedIDs map[int64]bool) (Prox
 		}
 	}
 	if len(pool) == 0 {
-		return Proxy{}, false
+		return Proxy{}, false, "unavailable"
+	}
+	blockedReason := ""
+	addReason := func(reason string) {
+		if blockedReason == "" {
+			blockedReason = reason
+		} else if blockedReason != reason {
+			blockedReason = "mixed"
+		}
 	}
 	if preferID > 0 && (excludedIDs == nil || !excludedIDs[preferID]) {
 		for _, p := range pool {
 			if p.ID == preferID {
-				if ok, _ := trySlotAcquire(p.ID); ok {
-					return p, true
+				if ok, reason := trySlotAcquire(p.ID); ok {
+					if rtCfg().ProxyStrategy == "sticky" {
+						setStickyProxy(p.URL, p.ID, p.Name)
+					}
+					return p, true, ""
+				} else {
+					addReason(reason)
 				}
 				break // 绑的那个满了，往下走正常轮询
 			}
@@ -448,8 +313,10 @@ func pickProxyPreferringExcept(preferID int64, excludedIDs map[int64]bool) (Prox
 		if stickyURL != "" && (excludedIDs == nil || !excludedIDs[stickyID]) {
 			for _, p := range pool {
 				if p.URL == stickyURL {
-					if ok, _ := trySlotAcquire(p.ID); ok {
-						return p, true
+					if ok, reason := trySlotAcquire(p.ID); ok {
+						return p, true, ""
+					} else {
+						addReason(reason)
 					}
 					break
 				}
@@ -461,14 +328,16 @@ func pickProxyPreferringExcept(preferID int64, excludedIDs map[int64]bool) (Prox
 	start := atomic.AddUint64(&proxyCursor, 1) - 1
 	for i := 0; i < len(pool); i++ {
 		p := pool[(int(start)+i)%len(pool)]
-		if ok, _ := trySlotAcquire(p.ID); ok {
+		if ok, reason := trySlotAcquire(p.ID); ok {
 			if rtCfg().ProxyStrategy == "sticky" {
 				setStickyProxy(p.URL, p.ID, p.Name)
 			}
-			return p, true
+			return p, true, ""
+		} else {
+			addReason(reason)
 		}
 	}
-	return Proxy{}, false
+	return Proxy{}, false, blockedReason
 }
 
 // recordProxyResult 回写一次请求的结果，并同步更新内存里那一条。
@@ -544,377 +413,3 @@ func forceProxyCooldown(id int64, errStr string) {
 	proxyMu.Unlock()
 }
 
-// Dynamic Proxy Pool Client Functions ────────────────────────────────────────
-
-type RemoteProxyItem struct {
-	URL          string `json:"url"`
-	Type         string `json:"type"`
-	IP           string `json:"ip"`
-	Port         string `json:"port"`
-	SuccessCount int    `json:"success_count"`
-	FailCount    int    `json:"fail_count"`
-}
-
-type RemoteProxyReportReq struct {
-	URL     string `json:"url"`
-	Success bool   `json:"success"`
-}
-
-func normalizePoolURL(poolURL string) string {
-	u := strings.TrimSpace(poolURL)
-	if u == "" {
-		return ""
-	}
-	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		u = "http://" + u
-	}
-	return strings.TrimRight(u, "/")
-}
-
-func fetchRemoteProxy(poolURL string) (string, error) {
-	poolURL = normalizePoolURL(poolURL)
-	if poolURL == "" {
-		return "", errors.New("empty pool url")
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	reqURL := poolURL + "/api/proxy"
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("remote pool HTTP %d", resp.StatusCode)
-	}
-	var item RemoteProxyItem
-	if err := json.NewDecoder(resp.Body).Decode(&item); err != nil {
-		return "", err
-	}
-	if item.URL == "" {
-		return "", errors.New("empty proxy url from remote pool")
-	}
-	return item.URL, nil
-}
-
-func reportRemoteProxyResult(poolURL, proxyURL string, success bool) {
-	poolURL = normalizePoolURL(poolURL)
-	if poolURL == "" || proxyURL == "" {
-		return
-	}
-	go func() {
-		client := &http.Client{Timeout: 5 * time.Second}
-		reqURL := strings.TrimRight(poolURL, "/") + "/api/proxy/report"
-		payload := RemoteProxyReportReq{URL: proxyURL, Success: success}
-		b, err := json.Marshal(payload)
-		if err != nil {
-			return
-		}
-		resp, err := client.Post(reqURL, "application/json", bytes.NewReader(b))
-		if err == nil {
-			_ = resp.Body.Close()
-		}
-	}()
-}
-
-func parseRemoteProxyItems(bodyBytes []byte) ([]RemoteProxyItem, error) {
-	bodyBytes = bytes.TrimSpace(bodyBytes)
-	if len(bodyBytes) == 0 {
-		return nil, errors.New("empty response body")
-	}
-
-	// 1. 尝试 []RemoteProxyItem (JSON 对象数组)
-	var rawItems []RemoteProxyItem
-	if err := json.Unmarshal(bodyBytes, &rawItems); err == nil {
-		var valid []RemoteProxyItem
-		for _, item := range rawItems {
-			if strings.TrimSpace(item.URL) != "" {
-				valid = append(valid, item)
-			}
-		}
-		if len(valid) > 0 {
-			return valid, nil
-		}
-	}
-
-	// 2. 尝试 []string (字符串数组)
-	var strList []string
-	if err := json.Unmarshal(bodyBytes, &strList); err == nil && len(strList) > 0 {
-		var items []RemoteProxyItem
-		for _, s := range strList {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				items = append(items, RemoteProxyItem{URL: s})
-			}
-		}
-		if len(items) > 0 {
-			return items, nil
-		}
-	}
-
-	// 3. 尝试包裹对象 {"proxies": [...], ...}
-	var rawMap map[string]json.RawMessage
-	if err := json.Unmarshal(bodyBytes, &rawMap); err == nil {
-		for _, k := range []string{"proxies", "items", "data", "list", "proxies_list"} {
-			if sub, ok := rawMap[k]; ok {
-				if parsed, err := parseRemoteProxyItems(sub); err == nil && len(parsed) > 0 {
-					return parsed, nil
-				}
-			}
-		}
-	}
-
-	// 4. 尝试按行分隔的文本
-	lines := strings.Split(string(bodyBytes), "\n")
-	var items []RemoteProxyItem
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" && validateProxyURL(line) == nil {
-			items = append(items, RemoteProxyItem{URL: line})
-		}
-	}
-	if len(items) > 0 {
-		return items, nil
-	}
-
-	return nil, errors.New("failed to parse proxy list (unsupported format)")
-}
-
-func syncRemoteProxies(poolURL string) (int, error) {
-	poolURL = normalizePoolURL(poolURL)
-	if poolURL == "" {
-		return 0, errors.New("remote pool url is empty")
-	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	reqURL := poolURL + "/api/proxy/all"
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch proxies: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("remote pool HTTP %d", resp.StatusCode)
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	items, err := parseRemoteProxyItems(bodyBytes)
-	if err != nil {
-		return 0, err
-	}
-
-	imported := 0
-	for _, item := range items {
-		pURL := strings.TrimSpace(item.URL)
-		if pURL == "" {
-			continue
-		}
-		if err := validateProxyURL(pURL); err != nil {
-			continue
-		}
-		var count int
-		err := getDB().QueryRow(`SELECT COUNT(1) FROM proxies WHERE url=?`, pURL).Scan(&count)
-		if err != nil || count > 0 {
-			continue
-		}
-		name := item.IP
-		if item.Port != "" {
-			name += ":" + item.Port
-		}
-		if name == "" {
-			name = pURL
-		}
-		_, err = getDB().Exec(`INSERT INTO proxies(name, url, enabled, weight, created_at) VALUES (?,?,1,1,?)`,
-			name, pURL, time.Now().Unix())
-		if err == nil {
-			imported++
-		}
-	}
-	if imported > 0 {
-		loadProxies()
-	}
-	return imported, nil
-}
-
-func testRemoteProxyPool(poolURL string) (map[string]interface{}, error) {
-	poolURL = normalizePoolURL(poolURL)
-	if poolURL == "" {
-		return nil, errors.New("remote pool url is empty")
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	reqURL := poolURL + "/api/proxy/stats"
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		reqURL = poolURL + "/health"
-		resp2, err2 := client.Get(reqURL)
-		if err2 != nil {
-			return nil, fmt.Errorf("failed to connect to pool: %w", err)
-		}
-		defer resp2.Body.Close()
-		return map[string]interface{}{"status": "ok", "message": "connected via /health"}, nil
-	}
-	defer resp.Body.Close()
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return map[string]interface{}{"status": "ok", "message": "connected"}, nil
-	}
-	return result, nil
-}
-
-// CRUD ───────────────────────────────────────────────────────────────────────
-
-func proxyCreate(name, url string, weight int) (int64, error) {
-	if name == "" || url == "" {
-		return 0, errors.New("name and url required")
-	}
-	if err := validateProxyURL(url); err != nil {
-		return 0, err
-	}
-	if weight <= 0 {
-		weight = 1
-	}
-	id, err := insertID(`INSERT INTO proxies(name, url, enabled, weight, created_at)
-        VALUES (?,?,?,?,?)`, name, url, 1, weight, time.Now().Unix())
-	if err != nil {
-		return 0, err
-	}
-	loadProxies()
-	return id, nil
-}
-
-// validateProxyURL 校验代理 URL 协议。
-// 支持 http / https / socks5 / socks5h。
-//
-// scheme 按大小写不敏感比：URL 的 scheme 本来就不区分大小写，url.Parse 会统一转小写，
-// 所以 HTTP:// 在 4.0.0 那条不做校验的静态代理路径上是能正常工作的。校验若大小写
-// 敏感，升级时就会把这种值拦下来 —— 用户什么都没改，代理却不工作了。
-func validateProxyURL(s string) error {
-	low := strings.ToLower(s)
-	for _, p := range []string{"http://", "https://", "socks5://", "socks5h://"} {
-		if strings.HasPrefix(low, p) {
-			return nil
-		}
-	}
-	return errors.New("代理 URL 必须以 http:// / https:// / socks5:// / socks5h:// 开头")
-}
-
-func proxyUpdate(id int64, name, url string, enabled *bool, weight *int) error {
-	q := `UPDATE proxies SET `
-	args := []interface{}{}
-	parts := []string{}
-	if name != "" {
-		parts = append(parts, "name=?")
-		args = append(args, name)
-	}
-	if url != "" {
-		parts = append(parts, "url=?")
-		args = append(args, url)
-	}
-	if enabled != nil {
-		v := 0
-		if *enabled {
-			v = 1
-		}
-		parts = append(parts, "enabled=?")
-		args = append(args, v)
-	}
-	if weight != nil {
-		parts = append(parts, "weight=?")
-		args = append(args, *weight)
-	}
-	if len(parts) == 0 {
-		return nil
-	}
-	q += joinComma(parts) + " WHERE id=?"
-	args = append(args, id)
-	_, err := getDB().Exec(q, args...)
-	if err == nil {
-		loadProxies()
-	}
-	return err
-}
-
-func proxyDelete(id int64) error {
-	_, err := getDB().Exec(`DELETE FROM proxies WHERE id=?`, id)
-	if err == nil {
-		loadProxies()
-	}
-	return err
-}
-
-func proxyResetFailures(id int64) error {
-	_, err := getDB().Exec(`UPDATE proxies SET fail_count=0, last_error='' WHERE id=?`, id)
-	if err == nil {
-		loadProxies()
-	}
-	return err
-}
-
-func listProxies() []Proxy {
-	proxyMu.RLock()
-	defer proxyMu.RUnlock()
-	out := make([]Proxy, len(proxyCache))
-	copy(out, proxyCache)
-	return out
-}
-
-func joinComma(parts []string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += ", "
-		}
-		out += p
-	}
-	return out
-}
-
-// proxyNameByID 按 id 找代理名，找不到返回空串（0 = 还没绑 / 直连）。
-func proxyNameByID(id int64) string {
-	if id <= 0 {
-		return ""
-	}
-	proxyMu.RLock()
-	defer proxyMu.RUnlock()
-	for _, p := range proxyCache {
-		if p.ID == id {
-			return p.Name
-		}
-	}
-	return ""
-}
-
-// proxyUsableByID 这个出口现在还能不能用（存在 + enabled + 没熔断或已过冷却）。
-// 判断账号绑定的出口是不是还有效，无效才该重新绑。
-func proxyUsableByID(id int64) bool {
-	if id <= 0 {
-		return false
-	}
-	proxyMu.RLock()
-	defer proxyMu.RUnlock()
-	now := time.Now().Unix()
-	cooldown := rtCfg().ProxyCooldownMin
-	for _, p := range proxyCache {
-		if p.ID == id {
-			return proxyUsable(p, now, cooldown)
-		}
-	}
-	return false
-}
-
-// proxyURLByID 按 id 取代理 URL，找不到返回空串（直连）。
-func proxyURLByID(id int64) string {
-	if id <= 0 {
-		return ""
-	}
-	proxyMu.RLock()
-	defer proxyMu.RUnlock()
-	for _, p := range proxyCache {
-		if p.ID == id {
-			return p.URL
-		}
-	}
-	return ""
-}

@@ -256,14 +256,14 @@ func TestPickProxyPreferringExceptStatic(t *testing.T) {
 	}()
 
 	// 排除 101 时优先选 102
-	p, ok := pickProxyPreferringExcept(101, map[int64]bool{101: true})
+	p, ok, _ := pickProxyPreferringExcept(101, map[int64]bool{101: true})
 	if !ok || p.ID != 102 {
 		t.Fatalf("expected proxy 102, got p=%+v, ok=%v", p, ok)
 	}
 	releaseSlot(p.ID)
 
 	// 排除 101 和 102 时无可用
-	_, okAll := pickProxyPreferringExcept(0, map[int64]bool{101: true, 102: true})
+	_, okAll, _ := pickProxyPreferringExcept(0, map[int64]bool{101: true, 102: true})
 	if okAll {
 		t.Fatalf("expected no proxy available when all are excluded")
 	}

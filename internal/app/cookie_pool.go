@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -24,6 +25,9 @@ type CookieAccount struct {
 	LastError  string `json:"last_error"`
 	FailCount  int64  `json:"fail_count"`
 	ProxyID    int64  `json:"proxy_id"` // 绑定的出口，0 = 还没绑
+	// AuthUser 是浏览器里多号登录时的账号序号：同一串 cookie 里登着好几个号，
+	// 请求路径带 /u/N 才落到第 N 个号，0 = 默认号（裸路径）。
+	AuthUser int `json:"authuser"`
 }
 
 // splitCookiePairs 把 "k=v; k=v" 拆成键值对。
@@ -135,7 +139,7 @@ func accountInsert(label, cookie, note string) (int64, error) {
 // accountList 返回池里全部账号，按 id 升序。
 func accountList() []CookieAccount {
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser
 		 FROM accounts ORDER BY id`)
 	if err != nil {
 		return nil
@@ -145,7 +149,7 @@ func accountList() []CookieAccount {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser); err != nil {
 			continue
 		}
 		out = append(out, a)
@@ -160,10 +164,10 @@ func accountList() []CookieAccount {
 func accountByID(id int64) *CookieAccount {
 	var a CookieAccount
 	err := getDB().QueryRow(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser
 		 FROM accounts WHERE id=?`, id).
 		Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID)
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser)
 	if err != nil {
 		return nil
 	}
@@ -189,6 +193,18 @@ func accountSetStatus(id int64, status string) error {
 func accountUpdateMeta(id int64, label, note string) error {
 	_, err := getDB().Exec(`UPDATE accounts SET label=?, note=? WHERE id=?`,
 		strings.TrimSpace(label), strings.TrimSpace(note), id)
+	return err
+}
+
+// maxAuthUser 是账号序号上限。Google 一个浏览器最多同时登 10 个号，序号 0..9。
+const maxAuthUser = 9
+
+// accountSetAuthUser 改账号序号（/u/N 里的 N）。
+func accountSetAuthUser(id int64, n int) error {
+	if n < 0 || n > maxAuthUser {
+		return fmt.Errorf("账号序号要在 0..%d 之间，收到 %d", maxAuthUser, n)
+	}
+	_, err := getDB().Exec(`UPDATE accounts SET authuser=? WHERE id=?`, n, id)
 	return err
 }
 
@@ -417,7 +433,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	// 出口就按"无偏好"选了；等换号换到好号，出口已经定死 —— 于是好号的出口
 	// 粘性被坏号带偏。实测 1 好 2 坏时出口在两个代理间对半分。
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, authuser
 		 FROM accounts WHERE status='enabled' ORDER BY fail_count ASC, last_used_at ASC, id ASC`)
 	if err != nil {
 		return nil, false
@@ -426,7 +442,7 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 	for rows.Next() {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
-			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID); err != nil {
+			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID, &a.AuthUser); err != nil {
 			continue
 		}
 		if skip[a.ID] {
@@ -539,10 +555,13 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 
 	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了
 	invalidateXSRF(a.Cookie)
-	_, err = getXSRF(a.Cookie, proxyURL)
+	_, err = getXSRF(a.Cookie, a.AuthUser, proxyURL)
 	took := time.Since(t0).Milliseconds()
 	if err != nil {
-		markAccountResult(a.ID, false, err.Error())
+		// 断网、被拦这类不是 cookie 的错，不动健康度（也不算成功）
+		if xsrfErrBlamesCookie(err) {
+			markAccountResult(a.ID, false, err.Error())
+		}
 		return CookieCheck{Detail: explainCookieFailure(err), ProxyName: name, TookMs: took}
 	}
 	markAccountResult(a.ID, true, "")
@@ -559,10 +578,11 @@ func explainCookieFailure(err error) string {
 	switch {
 	case strings.Contains(msg, "no SNlM0e"):
 		return "cookie 已失效：页面能打开但没有登录态，请求会被当匿名处理"
-	case strings.Contains(msg, "HTTP 302"):
-		return "cookie 无效：被重定向到登录页"
+	// sorry 要排在 302 前面：跳 /sorry 也是 302，那是出口被拦不是 cookie 失效
 	case strings.Contains(msg, "HTTP 429"), strings.Contains(msg, "sorry"):
 		return "出口被上游限流，换个代理再试（不是 cookie 的问题）"
+	case strings.Contains(msg, "HTTP 302"):
+		return "cookie 无效：被重定向到登录页"
 	default:
 		return "检测失败：" + msg
 	}
@@ -667,4 +687,30 @@ func updateAccountCookie(id int64, cookie string) {
 		}
 	}
 	_, _ = getDB().Exec(`UPDATE accounts SET cookie=? WHERE id=?`, cookie, id)
+}
+
+// xsrfErrBlamesCookie 判断取 XSRF（抓 /app）失败是不是 cookie 的错。
+//
+// 只有这几种算：页面打开了但没有 SNlM0e（被当匿名）、401/403、3xx 跳到
+// accounts.google.com（登录页）。网络层错误（EOF、超时、代理连不上）、跳
+// /sorry、429、5xx 都是出口或上游的问题，算进 fail_count 会让好号在断网或
+// 代理抖动时连续 3 次被自动停用。
+func xsrfErrBlamesCookie(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), "no SNlM0e") {
+		return true
+	}
+	var se *appPageStatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch {
+	case se.Status == 401 || se.Status == 403:
+		return true
+	case se.Status >= 300 && se.Status < 400:
+		return strings.HasPrefix(se.Location, "accounts.google.com")
+	}
+	return false
 }

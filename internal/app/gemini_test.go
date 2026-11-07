@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -50,16 +51,16 @@ func TestModelHeader(t *testing.T) {
 		}
 	}
 	// 守的是「不许冒出假模型」：thinking 版复用同样的 hex，所以看**去重后的 hex 数**，
-	// 不是条目数。服务端清单（otAQ7b）里 3.6/3.5-lite/3.1-pro + 灰度放出的 3.7 = 4 个。
+	// 不是条目数。服务端清单（otAQ7b）里 3.6/3.5-lite/3.1-pro/3.8-flash + 4 Argon（#35）= 5 个。
 	hexes := map[string]bool{}
 	for _, m := range Models {
 		hexes[m.HexID] = true
 	}
-	if len(hexes) != 4 {
-		t.Errorf("只应存在 4 个真模型 hex, got %d", len(hexes))
+	if len(hexes) != 5 {
+		t.Errorf("只应存在 5 个真模型 hex, got %d", len(hexes))
 	}
 	// 反过来：每个真 hex 都应该有一个 thinking 版
-	for _, base := range []string{hexFlash36, hexFlashLite, hexPro31, hexFlash38} {
+	for _, base := range []string{hexFlash36, hexFlashLite, hexPro31, hexFlash38, hexArgon4} {
 		found := false
 		for _, m := range Models {
 			if m.HexID == base && m.Thinking {
@@ -436,4 +437,29 @@ func mustPrompt(t *testing.T, msgs []map[string]interface{}, tools []map[string]
 	t.Helper()
 	p, _ := messagesToPrompt(msgs, tools, toolChoice)
 	return p
+}
+
+// #68：inner[31] 为真 = 上游出错话术。帧形状按实测抓的最小骨架拼。
+func TestFailureReplyInLine(t *testing.T) {
+	mk := func(v31 interface{}) string {
+		inner := make([]interface{}, 32)
+		inner[4] = []interface{}{[]interface{}{"rc_x", []interface{}{"I seem to be encountering an error. Can I try something else for you?"}}}
+		inner[31] = v31
+		ib, _ := json.Marshal(inner)
+		line, _ := json.Marshal([]interface{}{[]interface{}{"wrb.fr", nil, string(ib)}})
+		return string(line)
+	}
+	cases := []struct {
+		v    interface{}
+		want bool
+	}{{true, true}, {1, true}, {nil, false}, {false, false}, {0, false}}
+	for _, c := range cases {
+		if got := failureReplyInLine(mk(c.v)); got != c.want {
+			t.Errorf("inner[31]=%v: got %v want %v", c.v, got, c.want)
+		}
+	}
+	// 短 inner（不到 32 槽）不能越界
+	if failureReplyInLine(`[["wrb.fr",null,"[null,null,null,null,[[\"rc_x\",[\"hello world hello world hello world hello world hello world\"]]]]"]]` + strings.Repeat(" ", 200)) {
+		t.Error("short inner misdetected")
+	}
 }
